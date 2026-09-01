@@ -21,6 +21,7 @@ import {
   inspectResponseLogJson,
   inspectResponseLogSsePayloadParsed,
   recordFirstOutput,
+  httpStatusFromErrorEvent,
   type RequestLogContext,
   type RequestLogEntry,
 } from "./request-log";
@@ -715,7 +716,12 @@ export function terminalStatusFromParsed(parsed: unknown): ResponsesTerminalStat
     case "response.incomplete":
       return cyberPolicyTerminalError(parsed) ? "failed" : "incomplete";
     case "error":
-      return cyberPolicyTerminalError(parsed) ? "failed" : null;
+      // A bare `error` event is not a Responses terminal, so it used to fall through to the
+      // EOF path and be accounted as an incomplete success. One that stands in for an HTTP
+      // rejection (`status_code`, as the Codex websocket transport delivers a 429) is a
+      // failed terminal with that status — exactly what the SSE POST path would have got.
+      if (cyberPolicyTerminalError(parsed)) return "failed";
+      return httpStatusFromErrorEvent(parsed) !== undefined ? "failed" : null;
     default:
       return null;
   }
@@ -1207,7 +1213,7 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
           handlers.logCtx.transportPhase = "terminal_sse";
           handlers.logCtx.terminalSource = "upstream";
         }
-        handlers.onTerminal(status, policyTerminal ? 400 : undefined);
+        handlers.onTerminal(status, policyTerminal ? 400 : httpStatusFromErrorEvent(parsed));
       } finally {
         if (status === "failed" || status === "incomplete") clearCompletedItems();
       }

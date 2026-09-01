@@ -205,6 +205,13 @@ export interface RequestLogContext {
   upstreamError?: string;
   /** HTTP status derived from a terminal `response.failed` SSE payload (429/401/503/etc.). */
   terminalHttpStatus?: number;
+  /**
+   * Quota-window hints carried by a terminal `error` event that stands in for an HTTP
+   * rejection (the Codex websocket transport delivers a 429 this way, with the response
+   * headers embedded in the frame). Consumed by account cooldown, same as the HTTP headers.
+   */
+  terminalQuotaRetryAfter?: string;
+  terminalQuotaResetAt?: string[];
   /** Recognized structured terminal code whose exact identity must survive status mapping. */
   terminalErrorCode?: typeof CYBER_POLICY_ERROR_CODE;
   /**
@@ -1052,6 +1059,8 @@ function captureUpstreamErrorParsed(
   if (parsed !== undefined && parsed !== null) {
     const json = parsed as {
       type?: unknown;
+      status_code?: unknown;
+      headers?: unknown;
       error?: { message?: unknown };
       last_error?: { message?: unknown };
       response?: {
@@ -1103,10 +1112,55 @@ function incompleteReasonLabel(reason: string): string {
   }
 }
 
+/**
+ * HTTP status an in-stream `error` event stands in for, or undefined.
+ *
+ * Over HTTP SSE a quota/auth/server rejection is a real 429/401/5xx response and the
+ * pre-stream handlers key on that status. The Codex websocket transport accepts the
+ * upgrade first and then delivers the same rejection as an `error` frame carrying
+ * `status_code` (and the would-be response headers). Without reading that field the turn
+ * looked like an EOF: logged as 502, and — because an `error` event was no terminal at all —
+ * recorded as an *incomplete* success for account health, so an exhausted account never
+ * entered cooldown and kept being selected (usage_limit_reached loop).
+ */
+export function httpStatusFromErrorEvent(parsed: unknown): number | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const json = parsed as { type?: unknown; status_code?: unknown };
+  if (json.type !== "error") return undefined;
+  const status = json.status_code;
+  if (typeof status !== "number" || !Number.isInteger(status) || status < 400 || status > 599) {
+    return undefined;
+  }
+  return status;
+}
+
+const TERMINAL_QUOTA_RESET_HEADERS = [
+  "x-codex-primary-reset-at",
+  "x-codex-secondary-reset-at",
+  "x-codex-tertiary-reset-at",
+];
+
+/** Lift Retry-After / x-codex-*-reset-at out of an `error` event's embedded headers. */
+function captureTerminalQuotaHints(logCtx: RequestLogContext, headers: unknown): void {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return;
+  const byName = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (typeof value === "string" && value.trim()) byName.set(name.toLowerCase(), value.trim());
+  }
+  const retryAfter = byName.get("retry-after");
+  if (retryAfter !== undefined) logCtx.terminalQuotaRetryAfter = retryAfter;
+  const resetAt = TERMINAL_QUOTA_RESET_HEADERS
+    .map(name => byName.get(name))
+    .filter((value): value is string => value !== undefined);
+  if (resetAt.length > 0) logCtx.terminalQuotaResetAt = resetAt;
+}
+
 function captureTerminalHttpStatus(
   logCtx: RequestLogContext,
   json: {
     type?: unknown;
+    status_code?: unknown;
+    headers?: unknown;
     code?: unknown;
     message?: unknown;
     error?: { type?: unknown; code?: unknown; message?: unknown };
@@ -1136,6 +1190,12 @@ function captureTerminalHttpStatus(
   if (policy) {
     logCtx.terminalErrorCode = CYBER_POLICY_ERROR_CODE;
     logCtx.terminalHttpStatus = 400;
+    return;
+  }
+  const errorEventStatus = httpStatusFromErrorEvent(json);
+  if (errorEventStatus !== undefined) {
+    logCtx.terminalHttpStatus = errorEventStatus;
+    captureTerminalQuotaHints(logCtx, json.headers);
     return;
   }
   // A quota terminal can carry only a structured reason, without an error message.
