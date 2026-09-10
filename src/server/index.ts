@@ -40,6 +40,7 @@ import {
 } from "../codex/auth-api";
 import { activateResetCreditAutoRedeem } from "../codex/reset-credit-auto-redeem";
 import { registerCodexQuotaAutoRefreshWorker } from "../codex/quota-auto-refresh";
+import { registerCodexQuotaStalenessPrimer } from "../codex/quota-staleness-primer";
 import {
   reconcileLiveStateStores,
   setLiveStateStoreConfig,
@@ -1051,10 +1052,14 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   }
   let backgroundLifecycle: ReturnType<typeof acquireServerBackgroundLifecycle> | null = null;
   let unregisterQuotaAutoRefresh: (() => void) | null = null;
+  let unregisterQuotaStalenessPrimer: (() => void) | null = null;
   try {
     backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
     unregisterQuotaAutoRefresh = (deps.registerCodexQuotaAutoRefreshWorker
       ?? registerCodexQuotaAutoRefreshWorker)(config);
+    // Prime stale pool quota on the 60 s sweep tick so exhaustion readings
+    // self-heal without traffic or an operator refresh.
+    unregisterQuotaStalenessPrimer = registerCodexQuotaStalenessPrimer(config);
     // External `ocx config set` / direct config.json edits run in other
     // processes; poll the file so Logs/Usage display prices follow them live.
     // Started inside the guarded startup transaction so the catch below can
@@ -2447,6 +2452,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     }
   } catch (error) {
     unregisterQuotaAutoRefresh?.();
+    unregisterQuotaStalenessPrimer?.();
     userCostOverlayReconciler?.stop();
     backgroundLifecycle?.releaseAfterFailedStart();
     void nativeMainLifecycle.release();
@@ -2476,6 +2482,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
               userCostOverlayReconciler?.stop();
             } finally {
               unregisterQuotaAutoRefresh?.();
+              unregisterQuotaStalenessPrimer?.();
             }
           },
         ],

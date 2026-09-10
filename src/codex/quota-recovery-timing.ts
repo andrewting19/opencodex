@@ -26,3 +26,14 @@ export const WHAM_REQUEST_TIMEOUT_MS = 8_000;
  */
 export const QUOTA_RECOVERY_LEASE_MS =
   CODEX_REFRESH_FLIGHT_CEILING_MS + WHAM_REQUEST_TIMEOUT_MS * 2;
+
+/**
+ * How old a stored Codex quota row may get before a reader treats it as stale
+ * and a primer pass may re-fetch it.
+ *
+ * Declared here, in the leaf that both auth-api.ts and the pre-route selector can
+ * import, because the primers and the staleness checks must not drift to
+ * different thresholds - the same class of defect as the header/WHAM window
+ * mismatch this file exists to fence.
+ */
+export const CODEX_POOL_QUOTA_STALE_MS = 5 * 60_000;

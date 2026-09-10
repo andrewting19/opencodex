@@ -148,7 +148,7 @@ import { tryAcquireNativeMainProfileClaim } from "./native-main-admission";
 import { withNativeMainSharedClaim } from "./native-main-claim";
 import { resolveNativeProfileContext } from "./native-profile-store";
 import { NativeProfileError } from "./native-profile-types";
-import { WHAM_REQUEST_TIMEOUT_MS } from "./quota-recovery-timing";
+import { CODEX_POOL_QUOTA_STALE_MS, WHAM_REQUEST_TIMEOUT_MS } from "./quota-recovery-timing";
 import {
   claimQuotaRecovery,
   quotaRecoveryTerminalFor,
@@ -615,7 +615,9 @@ function expireCodexAuthFlow(flowId: string | null, error = "Login cancelled"): 
 }
 
 const MAIN_CACHE_TTL = 5 * 60_000;
-const POOL_CACHE_TTL = 5 * 60_000;
+// Share the staleness threshold with the pre-route lazy prime and the staleness
+// primer so writers and readers cannot diverge.
+const POOL_CACHE_TTL = CODEX_POOL_QUOTA_STALE_MS;
 const POOL_QUOTA_REFRESH_CONCURRENCY = 4;
 
 function nonEmptyPlan(value: unknown): string | null {
@@ -1840,7 +1842,12 @@ export async function primeCodexPoolQuotas(
             // Keep one local owner and one cross-process reader from physical
             // identity reconciliation through WHAM and all quota publication.
             (options.reconcileMainAccount ?? reconcileMainCodexAccountRuntimeState)();
-            if (getAccountQuota(MAIN_CODEX_ACCOUNT_ID)) return;
+            // The missing-only guard pinned a stale main reading forever once any
+            // row existed - a consumed reset credit on main stayed reported as
+            // exhausted across traffic. Re-read on the same TTL the pool rows
+            // already honor.
+            const existingMainQuota = getAccountQuota(MAIN_CODEX_ACCOUNT_ID);
+            if (existingMainQuota && Date.now() - existingMainQuota.updatedAt < POOL_CACHE_TTL) return;
             if (!(options.readMainTokens ?? readCodexTokens)()) return;
             if (options.fetchMainInfo) await options.fetchMainInfo(false);
             else await fetchMainAccountInfoAttempt(false, 1, mainLease, true);
