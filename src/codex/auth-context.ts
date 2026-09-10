@@ -62,6 +62,9 @@ import type { CodexCooldownSource, CodexQuotaScope } from "./routing";
 import { maskAccountId } from "../lib/privacy";
 import { formatErrorResponse } from "../bridge";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
+// The pre-route lazy prime must treat a stale stored row like a missing one.
+// Leaf import; no cycle.
+import { CODEX_POOL_QUOTA_STALE_MS } from "./quota-recovery-timing";
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig } from "../types";
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
 import { captureConfigGeneration } from "../lib/state-store-sweeper";
@@ -1203,7 +1206,15 @@ export async function resolveCodexAuthContext(
   // best-effort prime so the NEXT routing decision has real scores. This never
   // blocks the current request, and the helper's single-flight guard collapses
   // repeated triggers into one pass.
-  if (fixedAccountId === undefined && !nativeMainReadsForbidden && !getAccountQuota(accountId)) {
+  // Also treat a row older than the shared staleness threshold as unprimed:
+  // an account whose quota was stored before an early window reset (consumed
+  // reset credit, plan change, operator reset) must not keep routing from the
+  // stale reading. Traffic now heals the same row the 60 s staleness poll
+  // heals, and the two paths share one TTL.
+  const storedQuotaForPrime = getAccountQuota(accountId);
+  const quotaStaleForPrime = storedQuotaForPrime === null
+    || Date.now() - storedQuotaForPrime.updatedAt >= CODEX_POOL_QUOTA_STALE_MS;
+  if (fixedAccountId === undefined && !nativeMainReadsForbidden && quotaStaleForPrime) {
     if (options.primeCodexPoolQuotas) {
       void options.primeCodexPoolQuotas(config, "pre-route").catch(() => {});
     } else {

@@ -199,7 +199,12 @@ export async function primeCodexPoolQuotas(
             // Keep one local owner and one cross-process reader from physical
             // identity reconciliation through WHAM and all quota publication.
             (options.reconcileMainAccount ?? reconcileMainCodexAccountRuntimeState)();
-            if (getAccountQuota(MAIN_CODEX_ACCOUNT_ID)) return;
+            // The missing-only guard pinned a stale main reading forever once any
+            // row existed - a consumed reset credit on main stayed reported as
+            // exhausted across traffic. Re-read on the same TTL the pool rows
+            // already honor.
+            const existingMainQuota = getAccountQuota(MAIN_CODEX_ACCOUNT_ID);
+            if (existingMainQuota && Date.now() - existingMainQuota.updatedAt < POOL_CACHE_TTL) return;
             if (!(options.readMainTokens ?? readCodexTokens)()) return;
             if (options.fetchMainInfo) await options.fetchMainInfo(false);
             else await fetchMainAccountInfoAttempt(false, 1, mainLease, true);
