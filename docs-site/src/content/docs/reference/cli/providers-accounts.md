@@ -64,6 +64,19 @@ Use `--api-key` or an OAuth login for anything secret.
 
 ## Authentication
 
+### Caller credentials when Pool accounts are exhausted
+
+In Pool mode, a Codex request can supply its own ChatGPT login. If the selected
+stored account has a fresh, fully used ordinary quota, the router can use the
+caller's distinct subscription before sending a request to that stored account.
+The same rule applies while the stored account is in cooldown, including when a
+recovery probe is due. The cooldown remains in place.
+
+Exact account selections do not switch accounts. Unknown or stale quota does not
+trigger this rule. Ordinary usage does not describe separate Spark or Reserve
+quotas. The caller must still pass the existing model access and main-account
+policy checks.
+
 ### Diagnosing missing main-account quota
 
 `ocx account list openai --quota --refresh --json` includes a `quotaRefresh` object on
