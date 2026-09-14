@@ -46,7 +46,7 @@ import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./cata
 import type { CodexCooldownSource, CodexQuotaScope } from "./routing";
 import { maskAccountId } from "../lib/privacy";
 import { formatErrorResponse } from "../bridge";
-import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
+import { CODEX_EXHAUSTED_USAGE_PERCENT, CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
 // The pre-route lazy prime must treat a stale stored row like a missing one.
 // Leaf import; no cycle.
 import { CODEX_POOL_QUOTA_STALE_MS } from "./quota-recovery-timing";
@@ -958,6 +958,25 @@ export async function resolveCodexAuthContext(
   // a literal Retry-After reads very differently to a user than a reset-derived guess.
   const cooldown = getCodexQuotaHealthSnapshot(accountId, quotaScope);
   const cooldownUntil = cooldown?.cooldownUntil;
+  // A request-owned main bearer is outside stored Pool selection. When the Pool
+  // is drained, that exclusion must not make a known exhausted account (or its
+  // periodic recovery probe) replace the caller's distinct subscription. Resolve
+  // the caller before acquiring a probe lease or sending an upstream request.
+  // Ordinary usage does not describe independent Spark/Reserve quota scopes.
+  const selectedUsage = computeCodexUsageScore(
+    storedQuotaForPrime,
+    config.codexAccounts?.find(account => account.id === accountId)?.plan,
+  );
+  const poolQuotaExhausted = !quotaStaleForPrime
+    && (quotaScope === undefined || quotaScope === "shared")
+    && selectedUsage !== CODEX_UNKNOWN_USAGE_SCORE
+    && selectedUsage >= CODEX_EXHAUSTED_USAGE_PERCENT;
+  if ((cooldownUntil || poolQuotaExhausted)
+    && requestScopedMainCredential && fixedAccountId === undefined
+    && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
+    && !callerIsCooledPoolAccount(headers, config, accountId)) {
+    return await resolveCallerOwnedMainContext();
+  }
   // A cooled-down account never sends traffic, so upstream recovery can never be
   // observed and the cooldown outlives the real limit. Admit one probe per
   // interval; its outcome decides whether the cooldown ends (#433).
@@ -974,14 +993,6 @@ export async function resolveCodexAuthContext(
       ? tryAcquireCodexQuotaScopeProbeLease(accountId, probeQuotaScope) ?? undefined
       : tryAcquireCodexQuotaProbeLease(accountId) ?? undefined;
     if (!probeLeaseId) {
-      // The selector can retain the configured Pool account when no stored
-      // alternate is eligible. A validated caller may still serve this request,
-      // just as it can after an upstream rejection, without changing Pool state.
-      if (requestScopedMainCredential && fixedAccountId === undefined
-        && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
-        && !callerIsCooledPoolAccount(headers, config, accountId)) {
-        return await resolveCallerOwnedMainContext();
-      }
       throw new CodexAccountCooldownError(accountId, cooldownUntil, cooldown?.cooldownSource, cooldown?.quotaScope);
     }
   }

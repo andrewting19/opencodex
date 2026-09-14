@@ -6,7 +6,7 @@ The main branch mirrors upstream so upgrade diffs stay one command away.
 
 ## Why this fork exists
 
-Two fixes matter for multi-account operation and are not upstream:
+Three fixes matter for multi-account operation and are not upstream:
 
 1. In-stream error frames are HTTP rejections (relay.ts, request-log.ts,
    responses/core.ts, tests/codex-error-event-http-status.test.ts).
@@ -29,6 +29,13 @@ Two fixes matter for multi-account operation and are not upstream:
    fires the pre-route and main-account primers on stale rows as well as
    missing ones, and shares one staleness constant, CODEX_POOL_QUOTA_STALE_MS,
    between writers and readers.
+
+3. Prefer a distinct caller credential over an exhausted Pool selection
+   (`auth-context.ts`). A request-owned main login is outside stored Pool selection.
+   A fresh 100% reading or a due cooldown probe must not send that request to an
+   exhausted stored account while the caller can serve it. This applies before
+   dispatch and keeps exact selectors, identity checks, independent quota scopes,
+   entitlement checks, and existing cooldown state.
 
 ## Rebase procedure after each upstream release
 

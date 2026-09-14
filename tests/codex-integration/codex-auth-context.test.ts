@@ -1317,6 +1317,77 @@ describe("Codex auth context", () => {
     }
   });
 
+  test.each(["gpt-6-astra", "gpt-5.6-luna"])("a fresh exhausted Pool quota uses the distinct caller for %s before a 429", async modelId => {
+    const cfg = config();
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pool_token", refreshToken: "pool_refresh",
+      expiresAt: Date.now() + 3_600_000, chatgptAccountId: "pool_acc",
+    });
+    setAccountQuotaFromParsed("pool-a", { weeklyPercent: 100 });
+    setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { weeklyPercent: 49 });
+    const inbound = new Headers({
+      authorization: "Bearer caller-keyring-token",
+      "chatgpt-account-id": "caller-keyring-account",
+    });
+    const ctx = await resolveCodexAuthContext(inbound, cfg, "pool", {
+      requestScopedMainCredential: true, modelId,
+      isMainAccountTokenLive: () => { throw new Error("must not read physical main"); },
+      getValidMainAccountToken: async () => { throw new Error("must not refresh physical main"); },
+    });
+    expect(ctx).toEqual({ kind: "main", accountId: null });
+    expect(headersForCodexAuthContext(inbound, ctx).get("authorization")).toBe("Bearer caller-keyring-token");
+    expect(cfg.activeCodexAccountId).toBe("pool-a");
+    expect(getCodexQuotaHealthSnapshot("pool-a", "shared")).toBeNull();
+  });
+
+  test("a due Pool cooldown probe does not replace a distinct caller credential", async () => {
+    const cfg = config();
+    const now = Date.now();
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pool_token", refreshToken: "pool_refresh",
+      expiresAt: now + 3_600_000, chatgptAccountId: "pool_acc",
+    });
+    recordCodexUpstreamOutcome(cfg, "pool-a", 429, {
+      now: now - CODEX_QUOTA_PROBE_INTERVAL_MS - 1,
+      modelId: "gpt-6-astra", resetAt: now + 3_600_000, fixedAccount: true,
+    });
+    const cooldown = getCodexQuotaHealthSnapshot("pool-a", "shared");
+    expect(cooldown).not.toBeNull();
+    await expect(resolveCodexAuthContext(new Headers({
+      authorization: "Bearer caller-keyring-token",
+      "chatgpt-account-id": "caller-keyring-account",
+    }), cfg, "pool", { requestScopedMainCredential: true, modelId: "gpt-6-astra" }))
+      .resolves.toEqual({ kind: "main", accountId: null });
+    expect(getCodexQuotaHealthSnapshot("pool-a", "shared")).toEqual(cooldown);
+  });
+
+  test.each(["exact", "same-subscription", "independent-scope", "unknown", "short-only", "stale", "main-excluded"])(
+    "exhausted-quota caller fallback preserves the %s boundary", async boundary => {
+      const cfg = config();
+      saveCodexAccountCredential("pool-a", {
+        accessToken: "pool_token", refreshToken: "pool_refresh",
+        expiresAt: Date.now() + 3_600_000, chatgptAccountId: "pool_acc",
+      });
+      if (boundary === "short-only") setAccountQuotaFromParsed("pool-a", { shortPercent: 0 });
+      else if (boundary !== "unknown") setAccountQuotaFromParsed("pool-a", { weeklyPercent: 100 });
+      const originalNow = Date.now;
+      const now = Date.now();
+      try {
+        if (boundary === "stale") Date.now = () => now + 5 * 60_000;
+        const ctx = await resolveCodexAuthContext(new Headers({
+          authorization: boundary === "same-subscription" ? "Bearer pool_token" : "Bearer caller-keyring-token",
+          "chatgpt-account-id": boundary === "same-subscription" ? "pool_acc" : "caller-keyring-account",
+        }), cfg, "pool", {
+          requestScopedMainCredential: true,
+          modelId: boundary === "independent-scope" ? "gpt-5.3-codex-spark" : "gpt-6-astra",
+          ...(boundary === "exact" ? { accountId: "pool-a" } : {}),
+          ...(boundary === "main-excluded" ? { excludeAccountId: MAIN_CODEX_ACCOUNT_ID } : {}),
+        });
+        expect(ctx).toMatchObject({ kind: "pool", accountId: "pool-a" });
+      } finally { Date.now = originalNow; }
+    },
+  );
+
   test("cooldown caller-main fallback never resurrects the cooled subscription", async () => {
     const now = 1_800_000_000_000;
     const originalNow = Date.now;
