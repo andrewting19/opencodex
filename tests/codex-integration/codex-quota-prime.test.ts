@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   primeCodexPoolQuotas,
+  fetchPoolAccountQuota,
+  fetchMainAccountInfo,
   getAccountQuota,
   updateAccountQuota,
   clearAccountQuota,
@@ -34,6 +36,7 @@ import {
 } from "../../src/server/lifecycle";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { getMainPolicyQuota, setAccountQuotaFromParsed } from "../../src/codex/quota";
 
 // Phase 20 (260630_wsl-account-autoswitch): startup/lazy quota priming.
 
@@ -147,6 +150,106 @@ describe("primeCodexPoolQuotas", () => {
       expect(modelRequests).toBe(0);
       expect(readCodexAccountRecord("pending")?.codexValidationPending).toBe(true);
       expect(readCodexAccountRecord("pending")?.lastCodexValidatedAt).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a complete weekly WHAM refresh retires obsolete monthly and burst windows and restores the third account", async () => {
+    const config = makeConfig({ activeCodexAccountId: "spent-1", autoSwitchThreshold: 80 });
+    for (const id of ["spent-1", "spent-2", "available"]) seedPoolAccount(config, id, "pro");
+    updateAccountQuota("spent-1", 100);
+    updateAccountQuota("spent-2", 100);
+    setAccountQuotaFromParsed("available", {
+      weeklyPercent: 15, monthlyPercent: 100, monthlyIsPrimaryWindow: true,
+      monthlyResetAt: 2_000_000_000, shortPercent: 100, shortResetAt: 2_000_000_000,
+      shortWindowSeconds: 18_000, resetCredits: 1,
+      customWindows: [{ label: "GPT-Reserve Weekly", percent: 25 }],
+    });
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => Response.json({
+        plan_type: "pro",
+        rate_limit: {
+          primary_window: { used_percent: 16, limit_window_seconds: 604_800, reset_at: 2_000_000_000 },
+          secondary_window: null,
+        },
+      });
+      const result = await fetchPoolAccountQuota("available", true, "pro");
+      expect(result.quota).toMatchObject({ weeklyPercent: 16, resetCredits: 1 });
+      for (const key of ["monthlyPercent", "monthlyResetAt", "monthlyIsPrimaryWindow", "shortPercent", "shortResetAt", "shortObservedAt", "shortWindowSeconds"]) {
+        expect(result.quota).not.toHaveProperty(key);
+      }
+      expect(result.quota?.customWindows).toEqual([{ label: "GPT-Reserve Weekly", percent: 25 }]);
+      expect(resolveCodexAccountForThread("recovered-third-account", config)).toBe("available");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a complete main refresh also retires obsolete windows from rotation and policy evidence", async () => {
+    seedMainAccount();
+    const originalFetch = globalThis.fetch;
+    let monthly = true;
+    try {
+      globalThis.fetch = async () => Response.json({
+        plan_type: "pro",
+        rate_limit: {
+          primary_window: { used_percent: monthly ? 100 : 16, limit_window_seconds: monthly ? 2_592_000 : 604_800 },
+          secondary_window: null,
+        },
+      });
+      await fetchMainAccountInfo(true);
+      expect(getMainPolicyQuota()?.monthlyPercent).toBe(100);
+      monthly = false;
+      await fetchMainAccountInfo(true);
+      expect(getAccountQuota(MAIN_CODEX_ACCOUNT_ID)?.weeklyPercent).toBe(16);
+      expect(getAccountQuota(MAIN_CODEX_ACCOUNT_ID)?.monthlyPercent).toBeUndefined();
+      expect(getMainPolicyQuota()?.weeklyPercent).toBe(16);
+      expect(getMainPolicyQuota()?.monthlyPercent).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test.each([
+    { rate_limit: { primary_window: { used_percent: 16, limit_window_seconds: 604_800 } } },
+    { rate_limit: { primary_window: { used_percent: 16 }, secondary_window: null } },
+    { rate_limit: { primary_window: { used_percent: 16, limit_window_seconds: 604_800 }, secondary_window: { used_percent: "bad" } } },
+    { rate_limit: { primary_window: null, secondary_window: null } },
+    { rate_limit_reset_credits: { available_count: 2 } },
+  ])("an incomplete WHAM refresh preserves known blocking windows: %j", async (data) => {
+    const config = makeConfig();
+    seedPoolAccount(config, "partial", "pro");
+    setAccountQuotaFromParsed("partial", { monthlyPercent: 100, monthlyIsPrimaryWindow: true, shortPercent: 100 });
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => Response.json(data);
+      await fetchPoolAccountQuota("partial", true, "pro");
+      expect(getAccountQuota("partial")).toMatchObject({ monthlyPercent: 100, monthlyIsPrimaryWindow: true, shortPercent: 100 });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test.each([
+    { seconds: 18_000, field: "shortPercent" },
+    { seconds: 2_592_000, field: "monthlyPercent" },
+  ])("a complete WHAM refresh keeps a real exhausted $field", async ({ seconds, field }) => {
+    const config = makeConfig();
+    seedPoolAccount(config, "limited", "pro");
+    updateAccountQuota("limited", 10);
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => Response.json({
+        plan_type: "pro",
+        rate_limit: {
+          primary_window: { used_percent: 100, limit_window_seconds: seconds },
+          secondary_window: { used_percent: 16, limit_window_seconds: 604_800 },
+        },
+      });
+      const result = await fetchPoolAccountQuota("limited", true, "pro");
+      expect(result.quota).toMatchObject({ weeklyPercent: 16, [field]: 100 });
     } finally {
       globalThis.fetch = originalFetch;
     }

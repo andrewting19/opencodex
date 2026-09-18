@@ -273,6 +273,8 @@ export function setAccountQuotaFromParsed(
   mainWriter?: MainQuotaWriter,
   policyQuota: Omit<StoredAccountQuota, "updatedAt"> | null = quota,
   historyEvidence?: QuotaObservationEvidence,
+  /** Only a complete WHAM window roster may remove windows absent from this observation. */
+  usageSnapshot?: WhamUsageResponse,
 ): void {
   quota = withoutRetiredCodexQuota(quota);
   policyQuota = withoutRetiredCodexQuota(policyQuota);
@@ -281,20 +283,21 @@ export function setAccountQuotaFromParsed(
   const isMain = accountId === MAIN_CODEX_ACCOUNT_ID;
   if (isMain && mainWriter && !isMainQuotaWriterLive(mainWriter)) return;
   hydrateAccountQuotasFromDisk();
-  const legacyExisting = accountQuota.get(accountId);
+  const replacesWindows = hasCompleteUsageWindowSnapshot(usageSnapshot);
+  const legacyExisting = quotaMergeBase(accountQuota.get(accountId), replacesWindows);
   const updatedAt = Date.now();
   if (historyEvidence && historyEvidence.writer.accountId === accountId && isPoolQuotaWriterLive(historyEvidence.writer)) {
     quotaHistory.append(historyEvidence.writer, { observedAt: historyEvidence.observedAt, source: historyEvidence.source,
       credentialGeneration: historyEvidence.writer.credentialGeneration, windows: historyWindows(historyEvidence.raw),
     }, updatedAt);
   }
-  // Legacy rotation keeps its existing carry behavior, but never inherits policy-only
-  // evidence that outlived its disk TTL. Policy has a separate, identity-checked base.
+  // Partial observations keep their carry behavior. Complete WHAM window rosters
+  // replace obsolete standard windows. Policy has a separate, identity-checked base.
   const next = mergeAccountQuota(quota, legacyExisting, updatedAt);
   accountQuota.set(accountId, next);
   if (isMain) {
     const policyExisting = mainWriter && mainPolicyQuota?.identityKey === mainWriter.identityKey
-      ? mainPolicyQuota.quota
+      ? quotaMergeBase(mainPolicyQuota.quota, replacesWindows && policyQuota !== null)
       : undefined;
     mainPolicyQuota = mainWriter && (policyQuota || policyExisting)
       ? {
@@ -310,6 +313,33 @@ export function setAccountQuotaFromParsed(
   if (!(quota.resetCredits !== undefined && !snapshotHasUsage(quota))) {
     notifyCodexQuotaSnapshot(accountId, next);
   }
+}
+
+/** Headers and incomplete WHAM payloads are partial updates, including credits-only reads. */
+function hasCompleteUsageWindowSnapshot(data: WhamUsageResponse | undefined): boolean {
+  const limits = data?.rate_limit;
+  if (!limits || !Object.hasOwn(limits, "primary_window") || !Object.hasOwn(limits, "secondary_window")) return false;
+  const validWindow = (window: WhamUsageWindow | null | undefined): boolean => window === null || (
+    !!window
+    && typeof window.used_percent === "number" && Number.isFinite(window.used_percent)
+    && window.used_percent >= 0 && window.used_percent <= 100
+    && typeof window.limit_window_seconds === "number" && Number.isFinite(window.limit_window_seconds)
+    && window.limit_window_seconds > 0
+  );
+  return !!(limits.primary_window || limits.secondary_window)
+    && validWindow(limits.primary_window)
+    && validWindow(limits.secondary_window)
+    && (!Object.hasOwn(limits, "tertiary_window") || validWindow(limits.tertiary_window));
+}
+
+/** Keep unrelated observations, but retire the old standard windows after a complete refresh. */
+function quotaMergeBase(existing: StoredAccountQuota | undefined, replacesWindows: boolean): StoredAccountQuota | undefined {
+  if (!existing || !replacesWindows) return existing;
+  return {
+    updatedAt: existing.updatedAt,
+    ...(existing.customWindows !== undefined ? { customWindows: existing.customWindows } : {}),
+    ...(existing.resetCredits !== undefined ? { resetCredits: existing.resetCredits } : {}),
+  };
 }
 
 /** One partial-window merge contract for legacy quota and identity-bound policy evidence. */

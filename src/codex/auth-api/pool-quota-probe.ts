@@ -341,7 +341,7 @@ export async function commitPoolQuotaResponse(
     return { quota: null, needsReauth: false, credentialGeneration: generation };
   }
   setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, quota,
-    ctx.poolWriter && isValidWhamHistoryObservation(data) ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined);
+    ctx.poolWriter && isValidWhamHistoryObservation(data) ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined, data);
   return {
     quota: getAccountQuota(accountId),
     needsReauth: false,
