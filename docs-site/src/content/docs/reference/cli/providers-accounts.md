@@ -5,6 +5,11 @@ description: Provider configuration, credentials, quota, and model catalog comma
 
 These commands configure upstream providers, authenticate accounts, manage credential pools, and control the model catalog exposed to Codex.
 
+For Codex accounts, a complete quota refresh removes old weekly, monthly, or five-hour
+windows that OpenAI no longer reports. This prevents an old exhausted window from
+blocking an account that has available quota. Partial or failed refreshes preserve
+known limits.
+
 ## Providers
 
 ### `ocx provider <subcommand>`

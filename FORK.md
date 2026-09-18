@@ -6,7 +6,7 @@ The main branch mirrors upstream so upgrade diffs stay one command away.
 
 ## Why this fork exists
 
-Three fixes matter for multi-account operation and are not upstream:
+Four fixes matter for multi-account operation and are not upstream:
 
 1. In-stream error frames are HTTP rejections (relay.ts, request-log.ts,
    responses/core.ts, tests/codex-error-event-http-status.test.ts).
@@ -36,6 +36,14 @@ Three fixes matter for multi-account operation and are not upstream:
    exhausted stored account while the caller can serve it. This applies before
    dispatch and keeps exact selectors, identity checks, independent quota scopes,
    entitlement checks, and existing cooldown state.
+
+4. Remove obsolete quota windows after a complete usage refresh (`quota.ts`,
+   `auth-api.ts`). The old merge kept a 100% monthly window after OpenAI changed
+   an account to a weekly window. This made a usable account appear exhausted.
+   A complete WHAM response now replaces the standard windows for both main and
+   stored accounts. Partial headers, incomplete responses, and credits-only
+   responses still preserve known windows. Tests cover third-account selection,
+   main policy evidence, and real monthly and five-hour exhaustion.
 
 ## Rebase procedure after each upstream release
 

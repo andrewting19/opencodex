@@ -98,6 +98,13 @@ An explicit `Retry-After` or an unclassified quota 429 is account-wide. A reset-
 the shared native group (including GPT-5.6 Terra/Luna). This allows a same-account combo to test an
 independent quota without allowing fallbacks that share the exhausted quota.
 
+A complete WHAM usage response replaces the cached standard quota windows for its
+captured account. Primary and secondary window fields must both be present; reported
+windows must have valid percentages and durations. This removes obsolete monthly or
+five-hour windows after a quota shape change. Partial headers, incomplete WHAM
+responses, and credits-only responses preserve known windows. Main policy evidence
+keeps its separate identity and validation guards.
+
 `pausedCodexAccountIds` is a persisted Pool eligibility boundary. A paused added account or the
 stable `__main__` alias remains visible for maintenance and quota reads, but is excluded from new
 affinity, quota rotation, cooldown probes, transient failover, and manual activation. In-flight
