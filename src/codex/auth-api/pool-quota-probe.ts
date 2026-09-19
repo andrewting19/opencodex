@@ -1,6 +1,6 @@
 import { capturePoolQuotaWriter, getValidCodexToken, isCodexAccountGenerationLive, forceRefreshCodexPoolToken, markCodexAccountValidated, markCodexAccountValidationFailed, readCodexAccountRecord, isTerminalCodexPoolRefreshFailure, CodexCredentialGenerationConflictError, CodexCredentialRefreshLockTimeoutError, CodexCredentialRefreshBusyError, CodexCredentialRefreshStaleError, TokenRefreshError } from "../account-store";
 import type { PoolQuotaWriter } from "../quota-types";
-import { isValidWhamHistoryObservation, getAccountQuota, isCompleteCodexQuotaRecoverySnapshot, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
+import { captureCodexQuotaObservation, codexQuotaUsageObservedAt, type CodexQuotaObservation, isValidWhamHistoryObservation, getAccountQuota, isCompleteCodexQuotaRecoverySnapshot, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
 import type { StoredAccountQuota, WhamUsageResponse } from "../quota";
 import type { ManualResetRefreshLineage } from "../routing";
 import { clearAccountNeedsReauth, markAccountNeedsReauth } from "../account-runtime-state";
@@ -91,10 +91,12 @@ export interface PoolQuotaProbeEvidence {
   onDispatch?: (sequence: number) => void;
   mayPublish?: () => boolean;
   attempted?: NonNullable<PoolQuotaResult["quotaProbeAttempted"]>;
+  observation?: CodexQuotaObservation;
 }
 
 export function markQuotaProbeAttempted(evidence: PoolQuotaProbeEvidence, credentialGeneration: number): void {
   const dispatchSequence = nextQuotaDispatchSequence();
+  evidence.observation = captureCodexQuotaObservation();
   evidence.attempted = { at: Date.now(), credentialGeneration, dispatchSequence };
   evidence.onDispatch?.(dispatchSequence);
 }
@@ -276,6 +278,7 @@ export async function recoverPoolQuotaFrom401(ctx: {
   const result = await commitPoolQuotaResponse(replay, {
     accountId, existing, configuredPlan, generation: refreshed.generation, writerGeneration, poolWriter,
     mayPublish: ctx.quotaProbeEvidence.mayPublish,
+    observation: ctx.quotaProbeEvidence.observation,
   });
   return result.freshCredentialGeneration === refreshed.generation ? {
     ...result,
@@ -318,6 +321,7 @@ export async function commitPoolQuotaResponse(
     writerGeneration: number;
     poolWriter?: PoolQuotaWriter;
     mayPublish?: () => boolean;
+    observation?: CodexQuotaObservation;
   },
 ): Promise<PoolQuotaResult> {
   const { accountId, existing, configuredPlan, generation, writerGeneration } = ctx;
@@ -340,8 +344,12 @@ export async function commitPoolQuotaResponse(
   if (!isCodexAccountGenerationLive(accountId, generation)) {
     return { quota: null, needsReauth: false, credentialGeneration: generation };
   }
-  setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, quota,
-    ctx.poolWriter && isValidWhamHistoryObservation(data) ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined, data);
+  if (!setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, quota,
+    ctx.poolWriter && isValidWhamHistoryObservation(data) ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined,
+    data, ctx.observation)) {
+    // A newer observation already committed; this late poll is neither fresh evidence nor proof.
+    return { quota: getAccountQuota(accountId), needsReauth: false, credentialGeneration: generation };
+  }
   return {
     quota: getAccountQuota(accountId),
     needsReauth: false,
@@ -398,6 +406,7 @@ export async function fetchFreshPoolAccountQuota(
     const committed = await commitPoolQuotaResponse(resp, {
       accountId, existing, configuredPlan, generation, writerGeneration, poolWriter,
       mayPublish: quotaProbeEvidence.mayPublish,
+      observation: quotaProbeEvidence.observation,
     });
     return withQuotaProbeEvidence(committed, quotaProbeEvidence);
   } catch (e) {
@@ -446,7 +455,7 @@ export async function fetchPoolAccountQuota(
   afterDispatchSequence?: number,
 ): Promise<PoolQuotaResult> {
   const existing = getAccountQuota(accountId);
-  if (afterDispatchSequence === undefined && !forceRefresh && existing && Date.now() - existing.updatedAt < POOL_CACHE_TTL) {
+  if (afterDispatchSequence === undefined && !forceRefresh && existing && Date.now() - codexQuotaUsageObservedAt(existing) < POOL_CACHE_TTL) {
     return {
       quota: existing,
       needsReauth: false,

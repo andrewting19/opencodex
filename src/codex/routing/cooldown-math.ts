@@ -102,7 +102,12 @@ export type CodexUpstreamOutcomeMeta = {
 };
 
 export function computeCodexUsageScore(quota: {
+  updatedAt?: number;
   weeklyPercent?: number;
+  weeklyObservedAt?: number;
+  weeklyResetAt?: number;
+  monthlyObservedAt?: number;
+  monthlyResetAt?: number;
   monthlyPercent?: number;
   shortPercent?: number;
   shortResetAt?: number;
@@ -110,9 +115,17 @@ export function computeCodexUsageScore(quota: {
 } | null, plan?: unknown, now: number = Date.now()): number {
   if (!quota) return CODEX_UNKNOWN_USAGE_SCORE;
   const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+  // A reading older than the Pool TTL, or one whose window has already reset, is not
+  // current evidence, so it cannot keep an account ranked as exhausted.
+  const current = (percent: number | undefined, observedAt?: number, resetAt?: number) =>
+    (observedAt !== undefined && now - observedAt >= 5 * 60_000)
+      || (resetAt !== undefined && resetAt > 0 && resetAt * 1000 <= now) ? undefined : percent;
+  const weekly = current(quota.weeklyPercent, quota.weeklyObservedAt, quota.weeklyResetAt);
+  const monthly = current(quota.monthlyPercent, quota.monthlyObservedAt, quota.monthlyResetAt);
+  const short = current(quota.shortPercent, quota.shortObservedAt, quota.shortResetAt);
   const longWindows = isThirtyDayOnlyCodexPlan(plan)
-    ? [quota.monthlyPercent]
-    : [quota.weeklyPercent, quota.monthlyPercent];
+    ? [monthly]
+    : [weekly, monthly];
   const knownLong = longWindows.filter(finite);
   // The short burst window only REFINES a known long-window position; it cannot stand in for
   // one. A snapshot carrying just `shortPercent: 0` would otherwise score a flat 0 and make an
@@ -128,7 +141,7 @@ export function computeCodexUsageScore(quota: {
   if (knownLong.length === 0) {
     return isTerminalShortWindow(quota, now) ? CODEX_EXHAUSTED_USAGE_PERCENT : CODEX_UNKNOWN_USAGE_SCORE;
   }
-  const values = finite(quota.shortPercent) ? [...knownLong, quota.shortPercent] : knownLong;
+  const values = finite(short) ? [...knownLong, short] : knownLong;
   return Math.max(...values);
 }
 

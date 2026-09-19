@@ -267,7 +267,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
     // Widening it to every supported native would have been the opposite error: gpt-5.5 and the
     // other non-flagship natives would newly raise a maintenance error where they used to fall
     // back and answer. This pins both edges.
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const config = cfg({ autoSwitchThreshold: 0 });
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 10, undefined, 20);
     const draining = { nativeMainSelectionOnly: true } as const;
@@ -288,7 +288,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("unqualified gated candidates pass their entitlement set into Pool preview", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const config = cfg({
       autoSwitchThreshold: 0,
       codexAccountNamespaces: { team: "account-a" },
@@ -368,7 +368,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("account selector fallback skips a model-scoped cooldown on its fixed account", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("pool-a", 95, undefined, 20);
     updateAccountQuota("account-a", 10, undefined, 20);
     const config = cfg({
@@ -390,7 +390,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("account selector fallback never uses Pool's account-wide cooldown probe", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now() - CODEX_QUOTA_PROBE_INTERVAL_MS - 1;
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS + 1;
     updateAccountQuota("pool-a", 95, undefined, 20);
     updateAccountQuota("account-a", 10, undefined, 20);
@@ -413,7 +413,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("account selector fallback ignores cooldowns for an unrelated quota scope", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("pool-a", 95, undefined, 20);
     updateAccountQuota("account-a", 10, undefined, 20);
     const config = cfg({
@@ -435,7 +435,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("Pool fallback skips a reset-derived cooldown in the model's quota scope", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("pool-a", 10, undefined, 20);
     const config = cfg({ subagentModelFallback: ["kimi/k3"] });
     recordCodexUpstreamOutcome(config, "pool-a", 429, {
@@ -452,7 +452,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("Pool fallback admits a due reset-derived probe in the model's quota scope", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS + 1;
     updateAccountQuota("pool-a", 10, undefined, 20);
     const config = cfg({ subagentModelFallback: ["kimi/k3"] });
@@ -471,7 +471,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("Pool fallback ignores a reset-derived cooldown for an unrelated quota scope", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("pool-a", 10, undefined, 20);
     const config = cfg({ subagentModelFallback: ["kimi/k3"] });
     recordCodexUpstreamOutcome(config, "pool-a", 429, {
@@ -488,7 +488,7 @@ test("the native-main drain sentinel covers the flagships without widening to gp
   });
 
   test("Pool fallback preserves account-wide cooldown probe pacing", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS + 1;
     updateAccountQuota("pool-a", 10, undefined, 20);
     const config = cfg({ subagentModelFallback: ["kimi/k3"] });

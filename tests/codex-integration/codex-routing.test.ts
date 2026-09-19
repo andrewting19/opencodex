@@ -904,7 +904,7 @@ describe("codex routing", () => {
 
   test("429 with Retry-After records an account cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
 
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "120", now });
 
@@ -922,7 +922,7 @@ describe("codex routing", () => {
 
   test("429 uses Codex reset headers as cooldown fallback", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
 
     recordCodexUpstreamOutcome(config, "a", 429, {
       now,
@@ -937,7 +937,7 @@ describe("codex routing", () => {
 
   test("429 on the active account clears affinity and switches new threads to an available pool account", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("quota-existing", config)).toBe("a");
@@ -951,7 +951,7 @@ describe("codex routing", () => {
 
   test("a bound thread does not return to the quota group that refused it once the capped cooldown lapses", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("reserve-refused", config, now, "reserve")).toBe("a");
@@ -983,7 +983,7 @@ describe("codex routing", () => {
       codexAccounts: [{ id: "a", email: "a@test", isMain: false }],
       activeCodexAccountId: MAIN_CODEX_ACCOUNT_ID,
     });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 10);
     updateAccountQuota("a", 20);
     expect(resolveCodexAccountForThread("main-reserve-first", config, now, "reserve")).toBe(MAIN_CODEX_ACCOUNT_ID);
@@ -1009,7 +1009,7 @@ describe("codex routing", () => {
 
   test("naming the account overrules an avoidance the refusal recorded on the scoped lane", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     recordCodexUpstreamOutcome(config, "a", 429, {
@@ -1030,7 +1030,7 @@ describe("codex routing", () => {
 
   test("clearing the cooldown also lifts the avoidance that refusal announced", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     recordCodexUpstreamOutcome(config, "a", 429, {
@@ -1049,7 +1049,7 @@ describe("codex routing", () => {
 
   test("clearing a lapsed cooldown still lifts the avoidance it left behind", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     recordCodexUpstreamOutcome(config, "a", 429, {
@@ -1071,7 +1071,7 @@ describe("codex routing", () => {
 
   test("a request the account serves releases the threads its quota refusal moved", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("reserve-recovered", config, now, "reserve")).toBe("a");
@@ -1092,7 +1092,7 @@ describe("codex routing", () => {
 
   test("shared native reset cooldown clears affinity and rotates the active account", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("shared-quota-existing", config, now)).toBe("a");
@@ -1109,7 +1109,7 @@ describe("codex routing", () => {
 
   test("independent native quota scopes keep separate thread affinities", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -1153,7 +1153,7 @@ describe("codex routing", () => {
 
   test("2xx responses clear transient failures without clearing an unexpired cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "120", now });
 
     recordCodexUpstreamOutcome(config, "a", 200, { now: now + 1_000 });
@@ -1166,7 +1166,7 @@ describe("codex routing", () => {
 
   test("far-future resetAt is capped well below the 24h ceiling", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const fourDaysOut = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
 
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt: fourDaysOut, now });
@@ -1179,7 +1179,7 @@ describe("codex routing", () => {
 
   test("Retry-After keeps honoring long explicit delays", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
 
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "7200", now });
 
@@ -1189,7 +1189,7 @@ describe("codex routing", () => {
 
   test("retry-after cooldown is never probed", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "7200", now });
 
     // An explicit Retry-After is a literal retry directive, not a window hint.
@@ -1199,7 +1199,7 @@ describe("codex routing", () => {
 
   test("probe lease is granted at most once per interval", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
 
@@ -1212,7 +1212,7 @@ describe("codex routing", () => {
 
   test("leased probe success clears the hard cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1226,7 +1226,7 @@ describe("codex routing", () => {
 
   test("unleased 2xx preserves the hard cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
 
@@ -1238,7 +1238,7 @@ describe("codex routing", () => {
 
   test("mismatched lease id does not consume the probe", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1252,7 +1252,7 @@ describe("codex routing", () => {
 
   test("failed probe releases the lease and restarts the interval", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1267,7 +1267,7 @@ describe("codex routing", () => {
 
   test("stale-generation lease cannot clear a newer cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1291,7 +1291,7 @@ describe("codex routing", () => {
 
   test("clearCodexAccountCooldown lifts a live cooldown but keeps failure history", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "7200", now });
     expect(isCodexAccountInCooldown("a", now + 1_000)).toBe(true);
 
@@ -1308,7 +1308,7 @@ describe("codex routing", () => {
 
   test("clearCodexAccountCooldown lifts every live native-model cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1_000);
     recordCodexUpstreamOutcome(config, "a", 429, {
       now,
@@ -1330,7 +1330,7 @@ describe("codex routing", () => {
 
   test("clearing is a no-op without a live cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     expect(clearCodexAccountCooldown("a", now)).toBe(false);
 
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "60", now });
@@ -1340,7 +1340,7 @@ describe("codex routing", () => {
 
   test("manual clearing releases the in-flight lease, so a stale probe cannot erase the NEXT cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1362,7 +1362,7 @@ describe("codex routing", () => {
 
   test("a stale probe cannot void a later cooldown even while a fresh probe is live", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1387,7 +1387,7 @@ describe("codex routing", () => {
 
   test("credential failure ends the probe", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1403,7 +1403,7 @@ describe("codex routing", () => {
 
   test("unowned outcome preserves retry-after source", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "7200", now });
 
     recordCodexUpstreamOutcome(config, "a", 200, { now: now + 1_000 });
@@ -1415,7 +1415,7 @@ describe("codex routing", () => {
 
   test("unowned outcome keeps a reset-derived cooldown probeable", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
 
@@ -1428,7 +1428,7 @@ describe("codex routing", () => {
 
   test("in-flight lease survives an unowned outcome", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const resetAt = Math.floor((now + 4 * 24 * 60 * 60_000) / 1000);
     recordCodexUpstreamOutcome(config, "a", 429, { resetAt, now });
     const probeAt = now + CODEX_QUOTA_PROBE_INTERVAL_MS;
@@ -1447,7 +1447,7 @@ describe("codex routing", () => {
     // streak expiry, not the all-unknown quota rotation added in Phase 10).
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
 
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + CODEX_FAILURE_WINDOW_MS + 1 });
@@ -1462,7 +1462,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 200, { now: now + 1 });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 2 });
@@ -1503,7 +1503,7 @@ describe("codex routing", () => {
 
   test("one inspection read rejection records 502 without clearing affinity", async () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("reset-thread", config, now)).toBe("a");
@@ -1544,7 +1544,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 1 });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 2 });
@@ -1586,7 +1586,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 1 });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 2 });
@@ -1626,7 +1626,7 @@ describe("codex routing", () => {
 
   test("transient cooldown escalates to 2m, 10m, then the 30m cap", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
 
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 1 });
@@ -1643,7 +1643,7 @@ describe("codex routing", () => {
 
   test("escalation level 2 requires two consecutive healthy terminals to clear", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", 503, { now });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 1 });
 
@@ -1674,7 +1674,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     expect(resolveCodexAccountForThread("expired-thread", config, now)).toBe("a");
 
     expect(resolveCodexAccountForThread(
@@ -1688,7 +1688,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     expect(resolveCodexAccountForThreadDetailed("expired-detailed", config, now))
       .toMatchObject({ status: "selected", accountId: "a" });
 
@@ -1703,7 +1703,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     for (let i = 0; i < CODEX_THREAD_AFFINITY_MAX_ENTRIES + 1; i += 1) {
       expect(resolveCodexAccountForThread(`lru-${i}`, config, now + i)).toBe("a");
     }
@@ -1718,7 +1718,7 @@ describe("codex routing", () => {
 
   test("thread affinity LRU cap includes legacy and native quota scopes", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threads = Math.floor(CODEX_THREAD_AFFINITY_MAX_ENTRIES / 3) + 1;
 
     for (let i = 0; i < threads; i++) {
@@ -1741,7 +1741,7 @@ describe("codex routing", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     expect(resolveCodexAccountForThread("generation-thread", config, now)).toBe("a");
 
     saveCodexAccountCredential("a", {
@@ -1773,7 +1773,7 @@ describe("codex routing", () => {
 
   test("manual selection clears affinity and transient state but preserves hard cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
     expect(resolveCodexAccountForThread("manual-thread", config, now)).toBe("a");
@@ -1890,7 +1890,7 @@ describe("codex routing", () => {
 
   test("retired reset outcomes preserve shared health, affinity and selection", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     recordCodexUpstreamOutcome(config, "a", 503, {
       now: now - CODEX_TRANSIENT_SOFT_AVOID_MS - 1, fixedAccount: true,
@@ -2187,7 +2187,7 @@ describe("codex routing", () => {
   test("bound thread over threshold switches after the re-eval interval", () => {
     // Capacity-first is now opt-in, so this pins it explicitly (#4546).
     const config = makeConfig({ pool: { cacheAffinity: false } });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     // Bind t1 to a while a is cool.
@@ -2202,7 +2202,7 @@ describe("codex routing", () => {
 
   test("bound thread over threshold switches immediately without waiting for re-eval (#584)", () => {
     const config = makeConfig({ pool: { cacheAffinity: false } });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2215,7 +2215,7 @@ describe("codex routing", () => {
 
   test("bound thread under threshold stays even if a lower account exists", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2229,7 +2229,7 @@ describe("codex routing", () => {
 
   test("bound thread under threshold does not flap within the re-eval interval", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2243,7 +2243,7 @@ describe("codex routing", () => {
 
   test("bound thread over threshold switches once and does not ping-pong", () => {
     const config = makeConfig({ pool: { cacheAffinity: false } });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2257,7 +2257,7 @@ describe("codex routing", () => {
 
   test("bound thread with an all-unknown pool does not flap on re-eval", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2270,7 +2270,7 @@ describe("codex routing", () => {
 
   test("bound thread reuse under the interval still slides the idle TTL", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
     expect(resolveCodexAccountForThread("t1", config, now)).toBe("a");
@@ -2285,7 +2285,7 @@ describe("codex routing", () => {
   // Soft-avoid: transient failures block pool selection for a bounded window.
   test("transient failures soft-avoid only when the configured threshold is reached", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -2304,7 +2304,7 @@ describe("codex routing", () => {
 
   test("2xx clears soft-avoid but preserves hard quota cooldown", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     // First put "a" into hard cooldown via 429.
     recordCodexUpstreamOutcome(config, "a", 429, { retryAfter: "120", now });
     // Then a transient failure adds soft-avoid on top.
@@ -2322,7 +2322,7 @@ describe("codex routing", () => {
 
   test("soft-avoid extends on repeated transient failures", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     recordCodexUpstreamOutcome(config, "a", "connect_error", { now });
     recordCodexUpstreamOutcome(config, "a", "timeout", { now: now + 1 });
     recordCodexUpstreamOutcome(config, "a", 503, { now: now + 2 });
@@ -2333,7 +2333,7 @@ describe("codex routing", () => {
 
   test("soft-avoid is not applied when failover threshold is 0", () => {
     const config = makeConfig({ upstreamFailoverThreshold: 0 });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -2348,7 +2348,7 @@ describe("codex routing", () => {
   // Race-safe affinity: late failures must not delete a newer healthy binding.
   test("late failure from old account does not delete a newer healthy affinity", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -2369,7 +2369,7 @@ describe("codex routing", () => {
 
   test("threadId meta clears affinity only for the failing account", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -2384,7 +2384,7 @@ describe("codex routing", () => {
 
   test("failover streak clears all affinities for the failing account", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 20);
 
@@ -2478,7 +2478,7 @@ describe("codex account selection order", () => {
   });
 
   test("repeated model-gated round-robin requests reuse a separate detour affinity", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "model-detour-affinity";
     const modelId = "gpt-daybreak-blue-latest";
     const config = makeConfig({
@@ -2564,7 +2564,7 @@ describe("codex account selection order", () => {
   });
 
   test("quota detour re-evaluation skips failover-ready cooler candidates", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "quota-detour-failover-candidate";
     const modelId = "gpt-daybreak-blue-latest";
     const config = makeConfig({
@@ -2627,7 +2627,7 @@ describe("codex account selection order", () => {
   });
 
   test("ordinary quota affinity re-evaluation skips a failover-ready higher tier", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "ordinary-quota-failover-candidate";
     const config = makeConfig({
       pool: { cacheAffinity: false },
@@ -2667,7 +2667,7 @@ describe("codex account selection order", () => {
   });
 
   test("model preview and final keep a live detour after ordinary affinity cleanup", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "detour-after-ordinary-cleanup";
     const modelId = "gpt-daybreak-blue-latest";
     const config = makeConfig({
@@ -2718,7 +2718,7 @@ describe("codex account selection order", () => {
   });
 
   test("model detour affinities are independent within one quota scope", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "independent-model-detours";
     const config = makeConfig({
       accountPoolStrategy: "round-robin",
@@ -2777,7 +2777,7 @@ describe("codex account selection order", () => {
   });
 
   test("model detour LRU stays bounded without evicting ordinary affinity", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const threadId = "bounded-model-detours";
     const config = makeConfig({
       accountPoolStrategy: "round-robin",
@@ -2889,7 +2889,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s preserves healthy shared active, pin, and affinity during a model-only detour",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const threadId = `healthy-model-detour-${strategy}`;
       const config = makeConfig({
         accountPoolStrategy: strategy,
@@ -2920,7 +2920,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s skips a failover-ready detour candidate while preserving healthy shared state",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const config = makeConfig({
         accountPoolStrategy: strategy,
         accountPoolStickyLimit: 1,
@@ -2968,7 +2968,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s retires shared state when model ineligibility overlaps quota exhaustion",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const threadId = `quota-model-overlap-${strategy}`;
       const config = makeConfig({
         accountPoolStrategy: strategy,
@@ -3001,7 +3001,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s retires shared state when model ineligibility overlaps failover",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const threadId = `failure-model-overlap-${strategy}`;
       const config = makeConfig({
         accountPoolStrategy: strategy,
@@ -3039,7 +3039,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s cannot re-pick a quota-drained shared account that remains model-eligible",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const config = makeConfig({
         accountPoolStrategy: strategy,
         accountPoolStickyLimit: 1,
@@ -3076,7 +3076,7 @@ describe("codex account selection order", () => {
   test.each(["fill-first", "round-robin"] as const)(
     "%s cannot re-pick a failover-ready shared account that remains model-eligible",
     (strategy) => {
-      const now = 1_800_000_000_000;
+      const now = Date.now();
       const config = makeConfig({
         accountPoolStrategy: strategy,
         accountPoolStickyLimit: 1,
@@ -3137,7 +3137,7 @@ describe("codex account selection order", () => {
   });
 
   test("model-only detour failure does not retire the healthy operator pin", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const config = makeConfig({
       activeCodexAccountId: "b",
       activeCodexAccountPinned: "b",
@@ -3188,7 +3188,7 @@ describe("codex account selection order", () => {
   });
 
   test("genuine failure transition still retires a failing pin during model-scoped selection", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const config = makeConfig({
       activeCodexAccountId: "b",
       activeCodexAccountPinned: "b",
@@ -3232,7 +3232,7 @@ describe("codex account selection order", () => {
   });
 
   test("model ineligibility does not preserve a simultaneously failing pin", () => {
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     const config = makeConfig({
       activeCodexAccountId: "b",
       activeCodexAccountPinned: "b",

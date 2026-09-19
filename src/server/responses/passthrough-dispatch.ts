@@ -155,7 +155,8 @@ import type { RequestLogContext } from "../request-log";
 import { deferProtocolSafeResetRecovery, preflightComboStreamResponse } from "./combo-stream-preflight";
 import { authorizeResendForRecovery } from "../../lib/request-resend-gate";
 import { ambiguousResendAllowanceFor, selfContainedResponsesBody } from "./reset-replay";
-import { upstreamErrorMessageFromPayload, ENCRYPTED_FUNCTION_OUTPUT_REJECTION } from "../../lib/errors";
+import { upstreamErrorMessageFromPayload, isRateLimitOrQuotaFailureMessage, ENCRYPTED_FUNCTION_OUTPUT_REJECTION } from "../../lib/errors";
+import { CodexAccountAttempts } from "../../codex/account-attempts";
 import { isTransientConsoleGoUploadRejection } from "../../providers/opencode-zen-rate-limit";
 import { planReasoningEffortDowngrade } from "../../providers/reasoning-metadata";
 
@@ -907,7 +908,11 @@ export async function preparePassthroughExchange(
     // At most one reasoning-effort downgrade per request.
     const reasoningEffortDowngradeGuard: { attempted: boolean } = { attempted: false };
     let oauth401ReplayAttempted = false;
-    let codex401ReplayKind: "main" | "stored" | null = null;
+    // One request owns one attempt list: each eligible identity is refreshed and tried once.
+    let codexRefreshFailureAccount: string | null | undefined;
+    const capturedCodexResponses = new WeakSet<Response>();
+    const codexAttempts = new CodexAccountAttempts();
+    codexAttempts.visit(admissionState.authCtx, requestState.selectedForwardHeaders);
     // Console Go answers a transient 400 "Invalid upload request." for bodies it accepts
     // moments later; at most one byte-identical replay is allowed per request.
     const consoleGoUploadRetryGuard: { attempted: boolean } = { attempted: false };
@@ -1013,10 +1018,9 @@ export async function preparePassthroughExchange(
       upstreamResponse.status === 401
       && (admissionState.authCtx.kind === "main-pool" || admissionState.authCtx.kind === "pool")
       && usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)
-      && codex401ReplayKind === null
+      && codexAttempts.refreshOnce(admissionState.authCtx)
     ) {
-      codex401ReplayKind = admissionState.authCtx.kind === "pool" ? "stored" : "main";
-      try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed */ }
+      const codex401ReplayKind = admissionState.authCtx.kind === "pool" ? "stored" : "main";
       const poolAuthCtx = admissionState.authCtx.kind === "pool" ? admissionState.authCtx : undefined;
       const poolReplay = poolAuthCtx
         ? await refreshPoolForwardAuth({ req, config, route, authCtx: poolAuthCtx, substituteMainCredential, options, logCtx })
@@ -1036,10 +1040,13 @@ export async function preparePassthroughExchange(
             credentialGeneration: poolReplay.quarantineGeneration ?? poolAuthCtx.generation,
           });
         }
-        upstream.abort();
-        releaseCodexAuthContextProbeLease(admissionState.authCtx);
-        return replay.response;
-      }
+        // The refresh failed for THIS account only. Keep its answer and let the account
+        // recovery below try the next eligible identity before returning it.
+        await upstreamResponse.body?.cancel().catch(() => undefined);
+        upstreamResponse = replay.response;
+        codexRefreshFailureAccount = admissionState.authCtx.accountId;
+      } else {
+      await upstreamResponse.body?.cancel().catch(() => undefined);
       admissionState.authCtx = replay.authCtx;
       route.provider = replay.provider;
       requestState.selectedForwardHeaders = withClaudeNativeSession(replay.headers, replay.provider, options.claudeNativeSessionId);
@@ -1119,8 +1126,10 @@ export async function preparePassthroughExchange(
               route.provider.authMode === "forward",
             ).then(adoptObservedResponse);
           },
+          // A refreshed credential is about one account, and `refreshOnce` already allows one
+          // refresh per identity per request, so a spent base allowance still owes it one send.
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-            attempts: remainingTransientSendBudget(transientSendAttempts()),
+            attempts: Math.max(1, remainingTransientSendBudget(transientSendAttempts())),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
@@ -1129,9 +1138,8 @@ export async function preparePassthroughExchange(
         request.releaseBodyObservation?.();
       }
       continue passthroughRecovery;
+      }
     }
-
-    if (codex401ReplayKind !== null && upstreamResponse.status === 401) break;
 
     // Native Responses providers return before the generic adapter recovery loop below. Keep
     // their OAuth contract identical: one pre-stream 401 forces a credential refresh and one
@@ -1395,7 +1403,8 @@ export async function preparePassthroughExchange(
         || captureAuthCtx.kind === "pool"
         || captureAuthCtx.kind === "main-pool",
     ): void => {
-      if (!isCanonicalOpenAiForwardProvider(route.provider)) return;
+      if (!isCanonicalOpenAiForwardProvider(route.provider) || capturedCodexResponses.has(response)) return;
+      capturedCodexResponses.add(response);
       captureCodexAffinityDiagnostic({
         inboundHeaders: req.headers,
         outboundHeaders: captureRequest.headers,
@@ -1410,63 +1419,78 @@ export async function preparePassthroughExchange(
     };
     captureAffinityResponse(upstreamResponse);
 
-    if (usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)) {
+    const canRetryCodexAccount = usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)
+      || (admissionState.authCtx.kind === "main" && route.codexAccountMode === "pool"
+        && route.codexAccountId === undefined && !admissionState.authCtx.reserveAuthorization
+        && isCanonicalOpenAiForwardProvider(route.provider));
+    if (canRetryCodexAccount) {
+      // Inspect only lifecycle events. Any output item or tool event closes recovery, so a quota
+      // refusal delivered in-stream before output can still move to another eligible account.
+      const preflightLog: RequestLogContext = { model: logCtx.model, provider: logCtx.provider };
+      const accountPreflight = await preflightComboStreamResponse(upstreamResponse, preflightLog, payload => {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+        const type = (payload as { type?: unknown }).type;
+        const message = upstreamErrorMessageFromPayload(payload);
+        return (type === "error" || type === "response.failed" || type === "response.incomplete")
+          && message !== undefined && isRateLimitOrQuotaFailureMessage(message);
+      }, { allowMissingContentType: parsed.stream, replayReadErrors: true, maxWaitMs: 10_000, signal: upstream.signal });
+      if (upstream.signal.aborted) return transportFailureResponse(upstream.signal.reason);
+      upstreamResponse = accountPreflight.response;
+      const firstAuthCtx = admissionState.authCtx;
       let poolRetryOutcome: number | undefined;
       // A success is the freshest evidence there is about this pair, and it outranks any earlier
       // refusal: whatever the entitlement was when upstream declined, it is not that now. Both
       // ids are cleared because the wire model can differ from the routed one.
-      if (upstreamResponse.ok) {
+      if (upstreamResponse.ok && firstAuthCtx.kind !== "main") {
         clearCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
+          firstAuthCtx.accountId,
           route.modelId,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
+          firstAuthCtx.kind === "pool" ? firstAuthCtx.generation : undefined,
         );
         clearCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
+          firstAuthCtx.accountId,
           parsed.modelId,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
+          firstAuthCtx.kind === "pool" ? firstAuthCtx.generation : undefined,
         );
       }
-      const model400Denial = await codexPoolAccountModel400Denial(
+      const model400Denial = firstAuthCtx.kind === "main" ? undefined : await codexPoolAccountModel400Denial(
         upstreamResponse,
         route.modelId,
         options.abortSignal,
         parsed.modelId,
       );
-      if (model400Denial !== undefined) {
+      if (model400Denial !== undefined && firstAuthCtx.kind !== "main") {
         // Spend this refusal on more than one retry. It is the account's own authenticated
         // answer about this model, and the roster cache that selection otherwise reads expires
         // five minutes after a catalog sync fills it -- so without remembering this, the next
         // request selects the same account on quota alone and takes the same 400 (#4906).
         recordCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
+          firstAuthCtx.accountId,
           model400Denial,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
+          firstAuthCtx.kind === "pool" ? firstAuthCtx.generation : undefined,
         );
         poolRetryOutcome = 400;
-      } else if (!admissionState.authCtx.fixedAccount && await shouldRetryCodexPoolAccountQuota(
+      } else if (!isFixedCodexAccount(firstAuthCtx) && await shouldRetryCodexPoolAccountQuota(
         upstreamResponse,
         options.abortSignal,
       )) {
-        // Pre-stream only: once SSE has begun, mid-stream quota stays terminal.
+        // Pre-stream only: once output has begun, mid-stream quota stays terminal.
         // ChatGPT sometimes wraps quota exhaustion in a generic 5xx. Normalize only
         // body-confirmed cases to quota evidence so cooldown and rotation both apply.
         poolRetryOutcome = upstreamResponse.status >= 500 ? 429 : upstreamResponse.status;
-      } else if (!admissionState.authCtx.fixedAccount && shouldRetryCodexPoolAccountTransient(upstreamResponse)) {
+      } else if (!isFixedCodexAccount(firstAuthCtx) && firstAuthCtx.kind !== "main"
+        && shouldRetryCodexPoolAccountTransient(upstreamResponse)) {
         // A plain transient 5xx the same-account retry layer could not absorb. Keep the real
         // status so it records as transient rather than quota.
         poolRetryOutcome = upstreamResponse.status;
       }
+      // A credential this request already refreshed once, or could not refresh, belongs to one
+      // account; the next eligible identity may still serve the turn.
+      if ((upstreamResponse.status === 401 || codexRefreshFailureAccount === firstAuthCtx.accountId)
+        && !isFixedCodexAccount(firstAuthCtx)
+        && !outboundResponsesBodyCarriesEncryptedFunctionOutput(request.body)) poolRetryOutcome = upstreamResponse.status;
 
-      if (poolRetryOutcome !== undefined) {
-        // A stored Pool 401 spent this request's account budget on its own refresh and replay, so
-        // nothing afterwards may be paid for out of a DIFFERENT account. One flag carries that,
-        // rather than a status check here as well: a quota failure has no same-account move, so
-        // `sameAccountOnly` makes it terminal by refusing the alternate; the gated-model 400
-        // ladder does have one — retrying the account the refreshed roster still grants — and
-        // keeps it. An earlier revision also broke here on a non-400 outcome, which no test could
-        // justify because this flag already produced the identical result.
-        const storedReplaySpent = codex401ReplayKind === "stored";
+      if (poolRetryOutcome !== undefined && codexAttempts.remainingMs() > 0) {
         const retry = await retryCodexPoolOnAlternateAccount({
           callerAuthHeaders,
           config,
@@ -1474,10 +1498,10 @@ export async function preparePassthroughExchange(
           parsed,
           logCtx,
           options: { ...options, workflowRootId },
-          firstAuthCtx: admissionState.authCtx,
+          firstAuthCtx,
+          attempts: codexAttempts,
           firstResponse: upstreamResponse,
           outcomeStatus: poolRetryOutcome,
-          sameAccountOnly: storedReplaySpent,
           upstream,
           connectMs,
           passthroughEstimate,
@@ -1505,7 +1529,15 @@ export async function preparePassthroughExchange(
           requestState.selectedForwardHeaders = retry.selectedForwardHeaders;
           // Keep subagent quota-failure health keyed to the account that actually served.
           requestState.subagentFallbackAccountId = retry.authCtx.accountId;
+          // Every recovery above, including the next account move, applies to the new answer.
+          continue passthroughRecovery;
         }
+      }
+      if (accountPreflight.kind === "failed") {
+        // All candidates were considered. Retain the original stream terminal so
+        // normal relay, quota health, and client callbacks keep the same contract.
+        await upstreamResponse.body?.cancel().catch(() => undefined);
+        upstreamResponse = accountPreflight.originalResponse;
       }
     }
     // The deterministic route record cannot classify history it never observed (restart, expiry,

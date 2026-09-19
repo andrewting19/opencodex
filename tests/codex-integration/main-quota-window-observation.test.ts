@@ -308,9 +308,9 @@ describe("declared short-window producer evidence", () => {
         observationTime += 60_000;
         await fetchMainAccountInfo(true);
         expect(calls).toBe(4);
-        expect(getAccountQuota(MAIN)).toEqual({ weeklyPercent: 99, shortWindowSeconds: 3_600,
+        expect(getAccountQuota(MAIN)).toEqual({ weeklyPercent: 99, weeklyObservedAt: expect.any(Number), shortWindowSeconds: 3_600,
           shortResetAt: 4_000_000_000, updatedAt: observationTime });
-        expect(getMainPolicyQuota()).toEqual({ weeklyPercent: 99, shortPercent: 99, shortWindowSeconds: 18_000,
+        expect(getMainPolicyQuota()).toEqual({ weeklyPercent: 99, weeklyObservedAt: expect.any(Number), shortPercent: 99, shortWindowSeconds: 18_000,
           shortResetAt: 3_000_000_000, shortObservedAt: firstShortObservedAt, updatedAt: observationTime });
         const enabled = { codexMainAccountHardLock: true };
         expect(getMainAccountHardLockStatus(enabled, 3_000_000_000_000 - 1).state).toBe("blocked");
@@ -359,9 +359,9 @@ describe("declared short-window producer evidence", () => {
       observationTime += 60_000;
       headers.set("x-codex-primary-window-minutes", "60");
       applyAccountQuotaFromUpstreamHeaders(MAIN, headers, undefined, writer);
-      expect(getAccountQuota(MAIN)).toEqual({ weeklyPercent: 99, shortWindowSeconds: 3_600,
+      expect(getAccountQuota(MAIN)).toEqual({ weeklyPercent: 99, weeklyObservedAt: expect.any(Number), shortWindowSeconds: 3_600,
         shortResetAt: 4_000_000_000, updatedAt: observationTime });
-      expect(getMainPolicyQuota()).toEqual({ weeklyPercent: 99, shortPercent: 99, shortWindowSeconds: 18_000,
+      expect(getMainPolicyQuota()).toEqual({ weeklyPercent: 99, weeklyObservedAt: expect.any(Number), shortPercent: 99, shortWindowSeconds: 18_000,
         shortResetAt: 3_000_000_000, shortObservedAt: firstShortObservedAt, updatedAt: observationTime });
       const enabled = { codexMainAccountHardLock: true };
       expect(getMainAccountHardLockStatus(enabled, 3_000_000_000_000 - 1).state).toBe("blocked");

@@ -66,6 +66,9 @@ export function isTerminalShortWindow(
 
 export type StoredAccountQuota = {
   weeklyPercent?: number;
+  /** Observation clocks belong to individual windows, never to carried values. */
+  weeklyObservedAt?: number;
+  monthlyObservedAt?: number;
   monthlyPercent?: number;
   weeklyResetAt?: number;
   monthlyResetAt?: number;

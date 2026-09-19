@@ -6,7 +6,7 @@ The main branch mirrors upstream so upgrade diffs stay one command away.
 
 ## Why this fork exists
 
-Four fixes matter for multi-account operation and are not upstream:
+Five fixes matter for multi-account operation and are not upstream:
 
 1. In-stream error frames are HTTP rejections (relay.ts, request-log.ts,
    responses/core.ts, tests/codex-error-event-http-status.test.ts).
@@ -44,6 +44,17 @@ Four fixes matter for multi-account operation and are not upstream:
    stored accounts. Partial headers, incomplete responses, and credits-only
    responses still preserve known windows. Tests cover third-account selection,
    main policy evidence, and real monthly and five-hour exhaustion.
+
+5. Request-owned account recovery and quota observation order (`account-attempts.ts`,
+   `auth-context.ts`, `routing.ts`, `quota.ts`, and Responses/compact handlers).
+   Recovery considers every distinct eligible account before returning a quota error.
+   Token refresh is bounded per account. Cached percentages only affect ordering.
+   Caller-owned credentials remain private to the request. HTTP and WebSocket quota
+   failures can recover before output; tool or output events end that recovery window.
+   Weekly, monthly, and short windows retain separate observation times. Delayed usage
+   polls cannot replace newer quota evidence. Pauses, exact selectors, Reserve policy,
+   explicit Retry-After, credential generations, and probe leases remain enforced.
+   Client turn checkpoints are required for recovery after output has started.
 
 ## Rebase procedure after each upstream release
 

@@ -1,3 +1,4 @@
+import { resolveAvailableCodexAuthContext } from "../../codex/account-attempts";
 import type { OcxProviderConfig, OcxConfig } from "../../types";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import type { CodexAuthContext } from "../../codex/auth-context";
@@ -15,7 +16,6 @@ import {
 } from "../../providers/caller-authorization";
 import { inspectChatGptDomainClaim } from "../../oauth/chatgpt";
 import {
-  resolveCodexAuthContext,
   CodexMainProfileDrainingError,
   materializeCodexUpstreamAuthAsync,
   headersForCodexAuthContext,
@@ -222,7 +222,7 @@ export async function resolveResponsesCodexAuth(
     }
     let authCtx: CodexAuthContext;
     if (route.codexAccountMode) {
-      authCtx = await resolveCodexAuthContext(authInputHeaders, config, route.codexAccountMode, {
+      authCtx = await resolveAvailableCodexAuthContext(authInputHeaders, config, route.codexAccountMode, {
         admission: options.admission,
         codexAuthPolicy: options.codexAuthPolicy,
         accountId: route.codexAccountId,

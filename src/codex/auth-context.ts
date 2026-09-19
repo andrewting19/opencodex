@@ -61,7 +61,7 @@ import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./cata
 import type { CodexCooldownSource, CodexQuotaScope } from "./routing";
 import { maskAccountId } from "../lib/privacy";
 import { formatErrorResponse } from "../bridge";
-import { CODEX_EXHAUSTED_USAGE_PERCENT, CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
+import { codexQuotaUsageObservedAt, CODEX_EXHAUSTED_USAGE_PERCENT, CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
 // The pre-route lazy prime must treat a stale stored row like a missing one.
 // Leaf import; no cycle.
 import { CODEX_POOL_QUOTA_STALE_MS } from "./quota-recovery-timing";
@@ -809,6 +809,10 @@ export interface ResolveCodexAuthContextOptions {
   /** Live policy owner when the routing config is a caller-specific replay snapshot. */
   codexAuthPolicy?: CodexAuthPolicyConfig;
   excludeAccountId?: string;
+  /** Request-local exclusions across all previous attempts. */
+  excludedAccountIds?: ReadonlySet<string>;
+  callerAlreadyAttempted?: boolean;
+  allowQuotaProbe?: boolean;
   /** Resolve exactly this account without consulting or mutating Pool selection. */
   accountId?: string;
   /** Final native model selected for this request, used to select its quota group. */
@@ -862,7 +866,17 @@ export async function resolveCodexAuthContext(
   const {
     candidate: requestOwnedMainPinCandidate,
     preserve: preserveRequestOwnedMainPin,
-  } = requestOwnedMainPinState(headers, config, policy, requestScopedMainCredential, fixedAccountId);
+  } = requestOwnedMainPinState(
+    headers,
+    config,
+    policy,
+    // A caller credential this request already tried cannot become the pinned answer again.
+    requestScopedMainCredential
+      && !options.callerAlreadyAttempted
+      && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
+      && !options.excludedAccountIds?.has(MAIN_CODEX_ACCOUNT_ID),
+    fixedAccountId,
+  );
   // During an owned startup, equality cannot be established until recovery and the
   // memory-only policy binding finish. This read-only fence never probes a foreign home.
   if (policy.codexMainAccountHardLock === true && requestOwnedMainPinCandidate && isMainAccountPolicyBindingPending()) {
@@ -1052,6 +1066,8 @@ export async function resolveCodexAuthContext(
         : options.isMainAccountTokenLive,
       modelEligibleAccountIds,
       deniedModelAccountIds,
+      excludedAccountIds: options.excludedAccountIds,
+      allowQuotaProbe: options.allowQuotaProbe,
       // Request-scoped and deliberately absent from `sharedStateSelectionOptions`: one
       // conversation's attachments say nothing about where unrelated threads should be served.
       retainAccountForUploadedFiles: options.retainAccountForUploadedFiles === true,
@@ -1110,6 +1126,9 @@ export async function resolveCodexAuthContext(
         requestScopedMainCredential
         && fixedAccountId === undefined
         && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
+        && !options.callerAlreadyAttempted
+        && !options.excludedAccountIds?.has(MAIN_CODEX_ACCOUNT_ID)
+        && ![...(options.excludedAccountIds ?? [])].some(id => callerIsCooledPoolAccount(headers, config, id))
       ) {
         return await resolveCallerOwnedMainContext();
       }
@@ -1147,6 +1166,7 @@ export async function resolveCodexAuthContext(
       }
       throw new CodexPoolAuthenticationError();
     }
+    if (options.excludedAccountIds?.has(selected)) throw new CodexPoolAuthenticationError();
     accountId = selected;
     if (accountId === MAIN_CODEX_ACCOUNT_ID) assertMainAccountPolicy(policy);
     if (accountId === MAIN_CODEX_ACCOUNT_ID && nativeMainTrafficBlocked) {
@@ -1213,7 +1233,7 @@ export async function resolveCodexAuthContext(
   // heals, and the two paths share one TTL.
   const storedQuotaForPrime = getAccountQuota(accountId);
   const quotaStaleForPrime = storedQuotaForPrime === null
-    || Date.now() - storedQuotaForPrime.updatedAt >= CODEX_POOL_QUOTA_STALE_MS;
+    || Date.now() - codexQuotaUsageObservedAt(storedQuotaForPrime) >= CODEX_POOL_QUOTA_STALE_MS;
   if (fixedAccountId === undefined && !nativeMainReadsForbidden && quotaStaleForPrime) {
     if (options.primeCodexPoolQuotas) {
       void options.primeCodexPoolQuotas(config, "pre-route").catch(() => {});
@@ -1250,6 +1270,9 @@ export async function resolveCodexAuthContext(
   if ((cooldownUntil || poolQuotaExhausted)
     && requestScopedMainCredential && fixedAccountId === undefined
     && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
+    && !options.callerAlreadyAttempted
+    && !options.excludedAccountIds?.has(MAIN_CODEX_ACCOUNT_ID)
+    && ![...(options.excludedAccountIds ?? [])].some(id => callerIsCooledPoolAccount(headers, config, id))
     && !callerIsCooledPoolAccount(headers, config, accountId)) {
     // The Pool account's trial never runs on this request; hand it back (#4701).
     releaseTransientProbeGrant();

@@ -1,5 +1,6 @@
 import type { OcxConfig, OcxProviderConfig, OcxParsedRequest } from "../../types";
 import type { CodexAuthContext, CodexAuthPolicyConfig } from "../../codex/auth-context";
+import { resolveAvailableCodexAuthContext, type CodexAccountAttempts } from "../../codex/account-attempts";
 import type { CodexUpstreamOutcome } from "../../codex/routing";
 import {
   recordCodexUpstreamOutcome,
@@ -45,7 +46,6 @@ import {
   codexTransientProbeGrant,
   codexProbeQuotaScope,
   releaseCodexAuthContextProbeLease,
-  resolveCodexAuthContext,
   CodexPoolAuthenticationError,
   CodexAuthContextError,
   CodexAccountCooldownError,
@@ -356,18 +356,12 @@ export interface CodexPoolAccountRetryArgs {
     /** Root workflow this turn belongs to, so the move is charged there as well. */
     workflowRootId?: string;
   };
-  firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" }>;
+  /** A caller-owned main credential is a first attempt too; it has no Pool state to record. */
+  firstAuthCtx: CodexAuthContext;
+  /** This request's attempt list: each eligible identity is tried at most once. */
+  attempts: CodexAccountAttempts;
   firstResponse: Response;
   outcomeStatus: number;
-  /**
-   * Forbid resolving a DIFFERENT account for this retry.
-   *
-   * Set when a stored Pool 401 already spent this logical request's account budget on its own
-   * refresh and replay. The same-account gated-model retry above stays available, because it
-   * sends to the account that was already paying; only the alternate-account resolution below is
-   * out of budget.
-   */
-  sameAccountOnly?: boolean;
   upstream: AbortController;
   connectMs: number;
   passthroughEstimate?: number;
@@ -521,7 +515,7 @@ export async function retryCodexPoolOnAlternateAccount(
   // leave the account looking healthy no matter how many times it refused, and the pool would
   // keep handing it the next request.
   const recordUnmovedTransientOutcome = (): void => {
-    if (!isTransientUpstreamStatus(outcomeStatus)) return;
+    if (firstAuthCtx.kind === "main" || !isTransientUpstreamStatus(outcomeStatus)) return;
     recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
       threadId: firstAuthCtx.affinityKey,
       fixedAccount: firstAuthCtx.fixedAccount,
@@ -532,7 +526,8 @@ export async function retryCodexPoolOnAlternateAccount(
       writerGeneration: firstAuthCtx.writerGeneration,
     });
   };
-  if (outcomeStatus === 400 && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId)) {
+  if (firstAuthCtx.kind !== "main" && outcomeStatus === 400
+    && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId) && args.attempts.retryModelOnce(firstAuthCtx)) {
     invalidateCodexModelEntitlementsForAccount(firstAuthCtx.accountId);
     let refreshed;
     try {
@@ -555,7 +550,7 @@ export async function retryCodexPoolOnAlternateAccount(
   }
   // Exact account selectors may retry the same confirmed account above, but must never resolve
   // an alternate. Quota failures and a refreshed entitlement miss remain terminal.
-  if (!retryAuthCtx && (firstAuthCtx.fixedAccount || args.sameAccountOnly === true)) {
+  if (!retryAuthCtx && isFixedCodexAccount(firstAuthCtx)) {
     recordUnmovedTransientOutcome();
     return { kind: "no-alternate" };
   }
@@ -580,32 +575,44 @@ export async function retryCodexPoolOnAlternateAccount(
     ? args.options.sendBudget
     : undefined;
   let accountMovePermit: SingleUseDispatchPermit | undefined;
+  // A quota or credential refusal is about ONE account: the next account's quota is independent,
+  // so walking the Pool is not the #4546 amplification this budget bounds. Such a move is still
+  // charged when the budget has room, but a refusal does not end it; the request's own attempt
+  // list (each identity once, 120 s) bounds the walk. Transient moves keep the strict budget.
+  const accountScopedRefusal = outcomeStatus === 429 || outcomeStatus === 402 || outcomeStatus === 401;
   if (!retryAuthCtx && executionBudget) {
     const decision = executionBudget.reserveDispatch({
       sendClass: "account-failover",
       targetKey: `${route.providerName}|${route.modelId}|alternate-account`,
     });
-    if (!decision.allowed) {
+    if (!decision.allowed && !accountScopedRefusal) {
       recordUnmovedTransientOutcome();
       return { kind: "no-alternate" };
     }
-    accountMovePermit = decision.permit;
+    if (decision.allowed) accountMovePermit = decision.permit;
   }
   try {
-    retryAuthCtx ??= await resolveCodexAuthContext(
-        callerAuthHeaders,
-        config,
-        "pool",
-        {
-          excludeAccountId: firstAuthCtx.accountId,
+    while (!retryAuthCtx && args.attempts.remainingMs() > 0 && !upstream.signal.aborted) {
+      const candidate = await resolveAvailableCodexAuthContext(
+        callerAuthHeaders, config, "pool", {
+          excludeAccountId: firstAuthCtx.accountId ?? MAIN_CODEX_ACCOUNT_ID,
+          excludedAccountIds: args.attempts.excludedAccountIds,
+          callerAlreadyAttempted: args.attempts.callerAlreadyAttempted,
           admission: options.admission,
           codexAuthPolicy: options.codexAuthPolicy,
           modelId: route.modelId,
           requestScopedMainCredential: hasForwardableCodexBearer(callerAuthHeaders, config),
           beginCodexAccountSelection: codexAccountSelectionForTurn(options.turnAdmissionLease),
           resolveCodexModelEntitlements: entitlementResolver,
+          signal: AbortSignal.any([upstream.signal, AbortSignal.timeout(args.attempts.remainingMs())]),
         },
       );
+      const candidateHeaders = headersForCodexAuthContext(callerAuthHeaders, candidate,
+        options.codexAuthPolicy ?? config, route.modelId, options.admission);
+      // The same subscription under another id is not a new attempt.
+      if (args.attempts.visit(candidate, candidateHeaders)) retryAuthCtx = candidate;
+      else releaseCodexAuthContextProbeLease(candidate);
+    }
   } catch (error) {
     const unexpectedRetryError =
       !(error instanceof CodexPoolAuthenticationError)
@@ -631,7 +638,7 @@ export async function retryCodexPoolOnAlternateAccount(
     // A body-confirmed quota response may arrive under HTTP 5xx. Without an alternate,
     // the ordinary terminal recorder sees only that wire status and would misclassify it
     // as transient, leaving the exhausted account immediately selectable next turn.
-    if (outcomeStatus !== firstResponse.status && (outcomeStatus === 429 || outcomeStatus === 402)) {
+    if (firstAuthCtx.kind !== "main" && outcomeStatus !== firstResponse.status && (outcomeStatus === 429 || outcomeStatus === 402)) {
       recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
         ...codexQuotaOutcomeMeta(firstResponse),
         threadId: firstAuthCtx.affinityKey,
@@ -649,7 +656,7 @@ export async function retryCodexPoolOnAlternateAccount(
   }
 
   const quotaMeta = { ...codexQuotaOutcomeMeta(firstResponse), ...(await codexDenialOutcomeMeta(firstResponse)) };
-  if (outcomeStatus === 429 || outcomeStatus === 402) {
+  if (firstAuthCtx.kind !== "main" && (outcomeStatus === 429 || outcomeStatus === 402)) {
     const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/auth-api");
     applyAccountQuotaFromUpstreamHeaders(
       firstAuthCtx.accountId,
@@ -664,6 +671,7 @@ export async function retryCodexPoolOnAlternateAccount(
     options.deferCodexResetDerivedCooldown,
   );
   const recordFirstOutcome = (): void => {
+    if (firstAuthCtx.kind === "main") return;
     recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
       ...quotaMeta,
       threadId: firstAuthCtx.affinityKey,
@@ -672,6 +680,7 @@ export async function retryCodexPoolOnAlternateAccount(
       probeQuotaScope: codexProbeQuotaScope(firstAuthCtx),
       transientProbe: codexTransientProbeGrant(firstAuthCtx),
       writerGeneration: firstAuthCtx.writerGeneration,
+      credentialGeneration: firstAuthCtx.kind === "pool" ? firstAuthCtx.generation : undefined,
       // Retry already advanced the RR ring via excludeAccountId — reuse for promotion.
       ...(retryAuthCtx.accountId ? { promoteAccountId: retryAuthCtx.accountId } : {}),
     });
@@ -806,27 +815,28 @@ export async function retryCodexPoolOnAlternateAccount(
       }
       noteProviderAttemptSend(logCtx, route.providerName, route.provider, passthroughEstimate);
       try {
-        upstreamResponse = await fetchWithHeaderTimeout(
+        const sendAuthCtx = retryAuthCtx;
+        upstreamResponse = await args.attempts.run(upstream.signal, recoverySignal => fetchWithHeaderTimeout(
           request.url,
           {
             method: request.method,
             headers: request.headers,
             body: request.body,
           },
-          upstream.signal,
-          connectMs,
+          recoverySignal,
+          Math.min(connectMs, args.attempts.remainingMs()),
           stream,
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             providerName: route.providerName,
             modelId: route.modelId,
-            onCodexWsQuota: codexWsQuotaObserver(retryAuthCtx, route.provider, route.modelId),
+            onCodexWsQuota: codexWsQuotaObserver(sendAuthCtx, route.provider, route.modelId),
             beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
-              ? createCodexReserveDispatchGuard(retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
+              ? createCodexReserveDispatchGuard(sendAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
           }),
           // Credential-bearing forward send: never follow a redirect into a
           // dead-host rejection after the credential was seen (#914).
           route.provider.authMode === "forward",
-        );
+        ));
       } catch (error) {
         // Only the forward send is a transport boundary. Entitlement resolver throws below are
         // deliberately outside this catch so programming errors retain their original path.

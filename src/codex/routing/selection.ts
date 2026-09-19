@@ -17,6 +17,7 @@ import { codexPlanKey } from "../plan";
 import { MAIN_CODEX_ACCOUNT_ID, getMainAccountPlan, hasMainAccountRefreshGrant } from "../main-account";
 import type { OcxConfig } from "../../types";
 import { CODEX_FAILURE_WINDOW_MS, computeCodexUsageScore } from "./cooldown-math";
+import { canAcquireCodexQuotaProbeLease, canAcquireCodexQuotaScopeProbeLease } from "./probe-lease";
 import {
   codexPoolKeyForScope,
   dropSpentCredentialFailure,
@@ -157,6 +158,30 @@ export function withoutModelDeniedAccounts(
   return remaining.length > 0 ? remaining : ids;
 }
 
+/** A cooled account is a last-resort candidate only while its bounded probe lease is free. */
+function quotaCandidateAvailable(accountId: string, quotaScope: CodexQuotaScope | undefined,
+  now: number, allowProbe = false): boolean {
+  const health = getCodexQuotaHealthSnapshot(accountId, quotaScope, now);
+  if (!health) return true;
+  if (!allowProbe) return false;
+  return health.quotaScope ? canAcquireCodexQuotaScopeProbeLease(accountId, health.quotaScope, now)
+    : canAcquireCodexQuotaProbeLease(accountId, now);
+}
+
+/**
+ * The avoidance window a refusal announced keeps ordinary selection away. A last-resort pick
+ * may still send the single bounded probe that the cooldown's lease allows.
+ */
+function quotaAvoidanceApplies(accountId: string, quotaScope: CodexQuotaScope | undefined,
+  now: number, allowProbe = false): boolean {
+  if (!isCodexQuotaAvoided(accountId, quotaScope, now)) return false;
+  if (!allowProbe) return true;
+  const health = getCodexQuotaHealthSnapshot(accountId, quotaScope, now);
+  if (!health) return true;
+  return !(health.quotaScope ? canAcquireCodexQuotaScopeProbeLease(accountId, health.quotaScope, now)
+    : canAcquireCodexQuotaProbeLease(accountId, now));
+}
+
 export function getEligiblePoolAccounts(
   config: OcxConfig,
   excludeId?: string,
@@ -173,9 +198,9 @@ export function getEligiblePoolAccounts(
       && !isCodexAccountPlanExcluded(config, account.id, excludedPlans)
       && !isAccountNeedsReauth(account.id)
       && (!skipFailoverReadyCandidates || !shouldFailover(config, account.id, now)))
-    .filter(account => getCodexQuotaHealthSnapshot(account.id, quotaScope, now) === null)
+    .filter(account => quotaCandidateAvailable(account.id, quotaScope, now, selectionOptions?.allowQuotaProbe))
     .filter(account => !isCodexAccountSoftAvoided(account.id, now))
-    .filter(account => !isCodexQuotaAvoided(account.id, quotaScope, now))
+    .filter(account => !quotaAvoidanceApplies(account.id, quotaScope, now, selectionOptions?.allowQuotaProbe))
     .filter(account => !isCodexPoolRefreshCooling(account.id, now))
     .filter(account => isCodexAccountUsable(config, account.id, selectionOptions))
     .map(account => account.id);
@@ -185,14 +210,14 @@ export function getEligiblePoolAccounts(
     excludeId !== MAIN_CODEX_ACCOUNT_ID
     && !isCodexAccountPaused(config, MAIN_CODEX_ACCOUNT_ID)
     && (!isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID) || hasMainAccountRefreshGrant())
-    && getCodexQuotaHealthSnapshot(MAIN_CODEX_ACCOUNT_ID, quotaScope, now) === null
+    && quotaCandidateAvailable(MAIN_CODEX_ACCOUNT_ID, quotaScope, now, selectionOptions?.allowQuotaProbe)
     && !isCodexAccountSoftAvoided(MAIN_CODEX_ACCOUNT_ID, now)
     // The main login is not in `config.codexAccounts`, so it never passes through the
     // filters above and this is the only place an avoidance window can exclude it. Without
     // this the window a refusal announced applies to the pool but not to the account that
     // earned it: the cooldown caps at fifteen minutes, the window runs up to six hours, and
     // in between the main account returns as a first-class candidate.
-    && !isCodexQuotaAvoided(MAIN_CODEX_ACCOUNT_ID, quotaScope, now)
+    && !quotaAvoidanceApplies(MAIN_CODEX_ACCOUNT_ID, quotaScope, now, selectionOptions?.allowQuotaProbe)
     && !isCodexPoolRefreshCooling(MAIN_CODEX_ACCOUNT_ID, now)
     && (!skipFailoverReadyCandidates || !shouldFailover(config, MAIN_CODEX_ACCOUNT_ID, now))
     && isCodexAccountUsable(config, MAIN_CODEX_ACCOUNT_ID, selectionOptions)

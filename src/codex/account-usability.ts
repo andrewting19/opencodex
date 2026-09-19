@@ -16,6 +16,10 @@ export interface CodexAccountUsabilityOptions {
   nativeMainSelectionOnly?: boolean;
   /** Test seam for proving whether routing attempted a physical native-token read. */
   isMainAccountTokenLive?: typeof isMainAccountTokenLive;
+  /** Accounts already considered by this request; never affects shared Pool state. */
+  excludedAccountIds?: ReadonlySet<string>;
+  /** Last-resort selection still must claim the existing, bounded probe lease. */
+  allowQuotaProbe?: boolean;
   /** Confirmed account ids for an account-gated model; omitted for ordinary native models. */
   modelEligibleAccountIds?: ReadonlySet<string>;
   /**
@@ -106,5 +110,6 @@ export function isCodexAccountUsable(
   accountId: string,
   options: CodexAccountUsabilityOptions = {},
 ): boolean {
+  if (options.excludedAccountIds?.has(accountId)) return false;
   return codexAccountUnusableReason(config, accountId, options) === undefined;
 }

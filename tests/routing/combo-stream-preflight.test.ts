@@ -653,3 +653,42 @@ describe("combo stream preflight", () => {
   });
 
 });
+
+test("preflight time limit preserves its pending read and every stream byte", async () => {
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } });
+  const response = new Response(body, { headers: { "content-type": "text/event-stream" } });
+  const result = await preflightComboStreamResponse(response, { model: "test", provider: "test" }, undefined, { maxWaitMs: 5 });
+  expect(result.kind).toBe("accepted");
+  const expected = 'data: {"type":"response.output_text.delta","delta":"preserved"}\n\n';
+  streamController.enqueue(new TextEncoder().encode(expected));
+  streamController.close();
+  expect(await result.response.text()).toBe(expected);
+});
+
+test("preflight cancellation releases a stalled source", async () => {
+  let cancelled = false;
+  const abort = new AbortController();
+  const response = new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }), { headers: { "content-type": "text/event-stream" } });
+  const pending = preflightComboStreamResponse(response, { model: "test", provider: "test" }, undefined, { signal: abort.signal });
+  abort.abort();
+  const result = await pending;
+  expect(cancelled).toBe(true);
+  expect(await result.response.text()).toBe("");
+});
+
+test("a failed terminal with embedded tool output commits the account", async () => {
+  const payload = { type: "response.failed", response: { status: "failed", output: [{ type: "function_call", name: "write_file" }], error: { code: "usage_limit_reached", message: "usage limit reached" } } };
+  const result = await preflightComboStreamResponse(sse(payload), { model: "test", provider: "test" }, () => true);
+  expect(result.kind).toBe("accepted");
+  expect(await result.response.text()).toContain("write_file");
+});
+
+test("a pre-output quota frame retains explicit Retry-After evidence", async () => {
+  const payload = { type: "error", status_code: 429, error: { type: "usage_limit_reached", code: "usage_limit_reached", message: "usage limit reached" }, headers: { "retry-after": "120", "x-codex-primary-reset-at": "2100000000" } };
+  const result = await preflightComboStreamResponse(sse(payload), { model: "test", provider: "test" }, () => true);
+  expect(result.kind).toBe("failed");
+  expect(result.response.status).toBe(429);
+  expect(result.response.headers.get("retry-after")).toBe("120");
+  expect(result.response.headers.get("x-codex-primary-reset-at")).toBe("2100000000");
+});

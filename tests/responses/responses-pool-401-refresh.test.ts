@@ -370,7 +370,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     expect(isAccountNeedsReauth(ACCOUNT_ID)).toBe(false);
   });
 
-  test("Responses does not compose a stored-account replay 429 with another Pool account", async () => {
+  test("Responses tries another account after a stored-account replay 429", async () => {
     writeStoredAccount({
       [OTHER_ACCOUNT_ID]: storedRecord({
         accessToken: "other-access",
@@ -388,15 +388,13 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           return Response.json({ error: { message: "pool exhausted" } }, { status: 429 });
         }
         if (authorization === "Bearer other-access") {
-          return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+          return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
         }
         return undefined;
       },
     });
 
     const cfg = config({ secondAccount: true });
-    // This test needs one eligible alternate but must not advance the process-wide
-    // round-robin cursor used by the existing next-request affinity regression.
     cfg.accountPoolStrategy = "fill-first";
     const response = await handleResponses(
       request("/v1/responses"),
@@ -404,8 +402,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       { model: "", provider: "" } as RequestLogContext,
     );
 
-    expect(response.status).toBe(429);
-    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(response.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access", "Bearer other-access"]);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 
@@ -513,7 +511,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
   });
 
   for (const replayStatus of [429, 402] as const) {
-    test(`compact does not compose a stored-account replay ${replayStatus} with another account or remembered model`, async () => {
+    test(`compact tries another account after a stored-account replay ${replayStatus}`, async () => {
       const headers = { "x-codex-parent-thread-id": `compact-refresh-budget-${replayStatus}` };
       writeStoredAccount({
         [OTHER_ACCOUNT_ID]: storedRecord({
@@ -556,7 +554,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           }
           if (authorization === "Bearer other-access") {
             alternateAccountSends += 1;
-            return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+            return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
           }
           return undefined;
         },
@@ -575,13 +573,14 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
         { model: "", provider: "" } as RequestLogContext,
       );
 
-      expect(response.status).toBe(replayStatus);
+      expect(response.status).toBe(200);
       expect(harness.sends).toEqual([
         "Bearer seed-test-key",
         "Bearer rejected-access",
         "Bearer refreshed-access",
+        "Bearer other-access",
       ]);
-      expect(alternateAccountSends).toBe(0);
+      expect(alternateAccountSends).toBe(1);
       expect(seedModelSends).toBe(1);
       expect(harness.refreshes).toEqual(["refresh-grant"]);
     });
@@ -792,10 +791,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 
-  test("a stored-account replay 402 cannot reach another account even when one is eligible", async () => {
-    // The mirror of the case above: a quota failure has no same-account move left, so it is
-    // terminal. Asserted with a healthy alternate present, so passing means the budget stopped
-    // it rather than there being nowhere to go.
+  test("a stored-account replay 402 can use an eligible alternate", async () => {
     writeStoredAccount({
       [OTHER_ACCOUNT_ID]: storedRecord({
         accessToken: "other-access",
@@ -813,7 +809,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           return Response.json({ error: { message: "quota exhausted" } }, { status: 402 });
         }
         if (authorization === "Bearer other-access") {
-          return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+          return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
         }
         return undefined;
       },
@@ -827,21 +823,12 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       { model: "", provider: "" } as RequestLogContext,
     );
 
-    expect(response.status).toBe(402);
-    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(response.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access", "Bearer other-access"]);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 
-  test("a gated-model 400 after a stored replay refuses an alternate account", async () => {
-    // The narrow seam the budget leaves open, tested on the branch where it could leak. When the
-    // refreshed roster no longer grants the model, retryCodexPoolOnAlternateAccount would
-    // ordinarily resolve a DIFFERENT account; after a stored replay it must decline instead, or
-    // the 400 ladder becomes a way to spend the account budget twice.
-    //
-    // This covers the REFUSAL only. The same-account rescue that the ladder still allows is a
-    // different branch (retryAuthCtx = firstAuthCtx, taken when the refreshed roster still grants
-    // the model) and is covered by the opaque-blob case above, which is the ladder this fix was
-    // actually reported to have broken.
+  test("a gated-model 400 after a stored replay uses an entitled alternate", async () => {
     writeStoredAccount({
       [OTHER_ACCOUNT_ID]: storedRecord({
         accessToken: "other-access",
@@ -857,13 +844,12 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           return Response.json({ error: { message: "rejected bearer" } }, { status: 401 });
         }
         if (authorization === "Bearer refreshed-access") {
-          // Exactly the allow-listed unsupported-model detail the 400 ladder recognises.
           return Response.json({
             detail: `The '${gatedModel}' model is not supported when using Codex with a ChatGPT account.`,
           }, { status: 400 });
         }
         if (authorization === "Bearer other-access") {
-          return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+          return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
         }
         return undefined;
       },
@@ -876,10 +862,6 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       cfg,
       { model: "", provider: "" } as RequestLogContext,
       {
-        // Both accounts are entitled on the FIRST resolution, so ordinary selection still picks
-        // the affined work account and the stored 401 happens. From the retry resolution onward
-        // only the other account is entitled, which declines the same-account retry and leaves
-        // the alternate-account branch as the one under test.
         resolveCodexModelEntitlements: (() => {
           let call = 0;
           return async () => {
@@ -895,9 +877,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       },
     );
 
-    // The 400 is surfaced rather than paid for out of the other account.
-    expect(response.status).toBe(400);
-    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(response.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access", "Bearer other-access"]);
   });
 
   test("a combo stops after a stored replay 4xx that is neither quota nor a gated-model 400", async () => {

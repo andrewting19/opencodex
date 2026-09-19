@@ -66,6 +66,28 @@ const WEEKLY_WINDOW_MIN_MINUTES = WEEKLY_WINDOW_MIN_SECONDS / 60;
 export { resetAtToMs };
 
 const accountQuota = new Map<string, StoredAccountQuota>();
+// A usage request captures its order before network I/O. Headers capture on arrival.
+// A late poll must not overwrite newer evidence or issue fresh recovery proof.
+export type CodexQuotaObservation = { sequence: number; observedAt: number };
+let quotaObservationSequence = 0;
+const committedObservation = new Map<string, number>();
+let observationFloor = 0;
+export function isCodexQuotaObservationCurrent(accountId: string, observation: CodexQuotaObservation): boolean {
+  return observation.sequence >= Math.max(observationFloor, committedObservation.get(accountId) ?? 0);
+}
+export function captureCodexQuotaObservation(): CodexQuotaObservation {
+  return { sequence: ++quotaObservationSequence, observedAt: Date.now() };
+}
+
+/** Old persisted rows use their original write time, never the hydration time. */
+export function codexQuotaUsageObservedAt(quota: StoredAccountQuota): number {
+  const clocks = [
+    quota.weeklyPercent === undefined ? undefined : quota.weeklyObservedAt ?? quota.updatedAt,
+    quota.monthlyPercent === undefined ? undefined : quota.monthlyObservedAt ?? quota.updatedAt,
+    quota.shortPercent === undefined ? undefined : quota.shortObservedAt ?? quota.updatedAt,
+  ].filter((clock): clock is number => clock !== undefined);
+  return clocks.length ? Math.min(...clocks) : 0;
+}
 const quotaHistory = new CodexQuotaHistory();
 let lastReconciledGeneration = 0;
 let liveAccountIds = new Set<string>();
@@ -275,17 +297,20 @@ export function setAccountQuotaFromParsed(
   historyEvidence?: QuotaObservationEvidence,
   /** Only a complete WHAM window roster may remove windows absent from this observation. */
   usageSnapshot?: WhamUsageResponse,
-): void {
+  observation = captureCodexQuotaObservation(),
+): boolean {
   quota = withoutRetiredCodexQuota(quota);
   policyQuota = withoutRetiredCodexQuota(policyQuota);
-  if (!quota || (!snapshotHasUsage(quota) && quota.resetCredits === undefined)) return;
-  if (!mayCommitAccountQuota(accountId, writerGeneration)) return;
+  if (!quota || (!snapshotHasUsage(quota) && quota.resetCredits === undefined)) return false;
+  if (!mayCommitAccountQuota(accountId, writerGeneration)) return false;
+  if (!isCodexQuotaObservationCurrent(accountId, observation)) return false;
   const isMain = accountId === MAIN_CODEX_ACCOUNT_ID;
-  if (isMain && mainWriter && !isMainQuotaWriterLive(mainWriter)) return;
+  if (isMain && mainWriter && !isMainQuotaWriterLive(mainWriter)) return false;
   hydrateAccountQuotasFromDisk();
   const replacesWindows = hasCompleteUsageWindowSnapshot(usageSnapshot);
   const legacyExisting = quotaMergeBase(accountQuota.get(accountId), replacesWindows);
-  const updatedAt = Date.now();
+  const updatedAt = observation.observedAt;
+  committedObservation.set(accountId, observation.sequence);
   if (historyEvidence && historyEvidence.writer.accountId === accountId && isPoolQuotaWriterLive(historyEvidence.writer)) {
     quotaHistory.append(historyEvidence.writer, { observedAt: historyEvidence.observedAt, source: historyEvidence.source,
       credentialGeneration: historyEvidence.writer.credentialGeneration, windows: historyWindows(historyEvidence.raw),
@@ -313,6 +338,7 @@ export function setAccountQuotaFromParsed(
   if (!(quota.resetCredits !== undefined && !snapshotHasUsage(quota))) {
     notifyCodexQuotaSnapshot(accountId, next);
   }
+  return true;
 }
 
 /** Headers and incomplete WHAM payloads are partial updates, including credits-only reads. */
@@ -352,6 +378,9 @@ function mergeAccountQuota(
   quota = withoutRetiredCodexQuota(quota) ?? {};
   existing = withoutRetiredCodexQuota(existing ?? null) ?? undefined;
   const next: StoredAccountQuota = { updatedAt };
+  // Capture the age of carried values before any unrelated update changes updatedAt.
+  if (existing?.weeklyPercent !== undefined) next.weeklyObservedAt = existing.weeklyObservedAt ?? existing.updatedAt;
+  if (existing?.monthlyPercent !== undefined) next.monthlyObservedAt = existing.monthlyObservedAt ?? existing.updatedAt;
   const creditsOnly = quota.resetCredits !== undefined && !snapshotHasUsage(quota);
 
   if (creditsOnly) {
@@ -367,7 +396,10 @@ function mergeAccountQuota(
   }
 
   if (snapshotHasWeekly(quota)) {
-    if (quota.weeklyPercent !== undefined) next.weeklyPercent = quota.weeklyPercent;
+    if (quota.weeklyPercent !== undefined) {
+      next.weeklyPercent = quota.weeklyPercent;
+      next.weeklyObservedAt = updatedAt;
+    }
     if (quota.weeklyResetAt !== undefined) next.weeklyResetAt = quota.weeklyResetAt;
   } else if (snapshotHasMonthly(quota)
     && (!policyEvidence || quota.monthlyIsPrimaryWindow === true)) {
@@ -379,7 +411,10 @@ function mergeAccountQuota(
   }
 
   if (snapshotHasMonthly(quota)) {
-    if (quota.monthlyPercent !== undefined) next.monthlyPercent = quota.monthlyPercent;
+    if (quota.monthlyPercent !== undefined) {
+      next.monthlyPercent = quota.monthlyPercent;
+      next.monthlyObservedAt = updatedAt;
+    }
     if (quota.monthlyResetAt !== undefined) next.monthlyResetAt = quota.monthlyResetAt;
     // Carry the provenance with the value it describes. Recovery reads `freshQuota` directly,
     // so this is not on its path today — but a cached snapshot that kept `monthlyPercent`
@@ -422,6 +457,8 @@ function mergeAccountQuota(
 
   if (quota.resetCredits !== undefined) next.resetCredits = quota.resetCredits;
   else if (existing?.resetCredits !== undefined) next.resetCredits = existing.resetCredits;
+  if (next.weeklyPercent === undefined) delete next.weeklyObservedAt;
+  if (next.monthlyPercent === undefined) delete next.monthlyObservedAt;
 
   return next;
 }
@@ -610,7 +647,11 @@ export function updateAccountQuota(
   hydrateAccountQuotasFromDisk();
   const existing = accountQuota.get(accountId);
 
+  const observation = captureCodexQuotaObservation();
+  committedObservation.set(accountId, observation.sequence);
   const quota: StoredAccountQuota = {
+    ...(existing?.weeklyPercent !== undefined ? { weeklyObservedAt: existing.weeklyObservedAt ?? existing.updatedAt } : {}),
+    ...(existing?.monthlyPercent !== undefined ? { monthlyObservedAt: existing.monthlyObservedAt ?? existing.updatedAt } : {}),
     ...(existing?.weeklyPercent !== undefined ? { weeklyPercent: existing.weeklyPercent } : {}),
     ...(existing?.monthlyPercent !== undefined ? { monthlyPercent: existing.monthlyPercent } : {}),
     // Carry provenance with the value it describes. Dropping it here would downgrade a proven
@@ -630,10 +671,12 @@ export function updateAccountQuota(
   const nextMonthlyResetAt = normalizeResetAt(monthlyResetAt);
   if (nextWeekly !== undefined) {
     quota.weeklyPercent = nextWeekly;
+    quota.weeklyObservedAt = observation.observedAt;
     if (nextWeeklyResetAt !== undefined) quota.weeklyResetAt = nextWeeklyResetAt;
   }
   if (nextMonthly !== undefined) {
     quota.monthlyPercent = nextMonthly;
+    quota.monthlyObservedAt = observation.observedAt;
     if (nextMonthlyResetAt !== undefined) quota.monthlyResetAt = nextMonthlyResetAt;
     // A caller-supplied monthly value arrives without window provenance, so it REPLACES the
     // proven reading and must not inherit its flag — otherwise an unproven number would be
@@ -670,7 +713,7 @@ function readMainPolicyQuota(value: unknown): MainPolicyQuota | null {
     }
   }
   for (const field of [
-    "weeklyResetAt", "monthlyResetAt", "shortResetAt", "shortObservedAt", "shortWindowSeconds", "resetCredits",
+    "weeklyResetAt", "monthlyResetAt", "weeklyObservedAt", "monthlyObservedAt", "shortResetAt", "shortObservedAt", "shortWindowSeconds", "resetCredits",
   ] as const) {
     const number = raw[field];
     if (typeof number === "number" && Number.isFinite(number) && number >= 0) quota[field] = number;
@@ -771,12 +814,15 @@ export function clearAccountQuota(accountId?: string): void {
   if (accountId) {
     hydrateAccountQuotasFromDisk();
     accountQuota.delete(accountId);
+    committedObservation.set(accountId, ++quotaObservationSequence);
     if (accountId === MAIN_CODEX_ACCOUNT_ID) mainPolicyQuota = null;
     schedulePersistAccountQuotas();
     forgetCodexQuotaBaseline(accountId);
     return;
   }
   accountQuota.clear();
+  committedObservation.clear();
+  observationFloor = ++quotaObservationSequence;
   forgetCodexQuotaBaseline();
   mainPolicyQuota = null;
   diskHydrated = false;

@@ -1,3 +1,4 @@
+import { isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse, markCodexWsResponse } from "./codex-ws-wire";
 import type { ResponsesTerminalStatus } from "../../bridge";
 import { comboFailureDecision } from "../../combos";
 import { httpStatusFromTerminalError } from "../../lib/errors";
@@ -107,6 +108,10 @@ function retryableZeroOutputTerminal(payload: unknown): boolean {
  */
 export function comboStreamPayloadCommitsOutput(payload: unknown): boolean {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return true;
+  // Any snapshot that already carries output items (a failed terminal with an embedded tool
+  // call, for example) has committed that output; replaying it elsewhere could repeat it.
+  const nested = (payload as { response?: { output?: unknown } }).response;
+  if (Array.isArray(nested?.output) && nested.output.length > 0) return true;
   const type = (payload as { type?: unknown }).type;
   if (typeof type !== "string") return true;
   if (type === "response.created") {
@@ -155,6 +160,7 @@ function replayBufferedResponse(
   response: Response,
   reader: ReadableStreamDefaultReader<Uint8Array>,
   buffered: Uint8Array[],
+  pendingRead?: ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>,
 ): Response {
   let index = 0;
   const body = new ReadableStream<Uint8Array>({
@@ -164,7 +170,8 @@ function replayBufferedResponse(
         return;
       }
       try {
-        const next = await reader.read();
+        const next = await (pendingRead ?? reader.read());
+        pendingRead = undefined;
         if (next.done) controller.close();
         else controller.enqueue(next.value);
       } catch (error) {
@@ -175,11 +182,13 @@ function replayBufferedResponse(
       reader.cancel(reason).catch(() => undefined);
     },
   });
-  return new Response(body, {
+  const replay = new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   });
+  if (isCodexWsUpstreamResponse(response)) markCodexWsResponse(replay, isCodexWsQuotaObservedResponse(response));
+  return replay;
 }
 
 function failedTerminalResponse(
@@ -208,6 +217,14 @@ function failedTerminalResponse(
   headers.set("content-type", "application/json");
   headers.delete("content-length");
   headers.delete("content-encoding");
+  const setQuotaHint = (name: string, value: string | undefined): void => {
+    if (value === undefined || value.length > 128) return;
+    try { headers.set(name, value); } catch { /* malformed upstream hint is not HTTP authority */ }
+  };
+  setQuotaHint("retry-after", logCtx.terminalQuotaRetryAfter);
+  for (const [index, resetAt] of (logCtx.terminalQuotaResetAt ?? []).slice(0, 3).entries()) {
+    setQuotaHint(`x-codex-${["primary", "secondary", "tertiary"][index]}-reset-at`, resetAt);
+  }
   const usage = terminalResponse.usage;
   return new Response(JSON.stringify({
     error,
@@ -226,7 +243,8 @@ function failedTerminalResponse(
 
 export type ComboStreamPreflightResult =
   | { kind: "accepted"; response: Response }
-  | { kind: "failed"; response: Response }
+  /** `originalResponse` replays the buffered stream when no alternate can take the request. */
+  | { kind: "failed"; response: Response; originalResponse: Response }
   /**
    * The body errored mid-stream and `replayReadErrors` asked for the prefix back rather than
    * a rethrow. `stage` is how far the inspection actually got; whether that permits a
@@ -247,7 +265,7 @@ export async function preflightComboStreamResponse(
   response: Response,
   logCtx: RequestLogContext,
   retryableTerminal: (payload: unknown) => boolean = retryableZeroOutputTerminal,
-  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean },
+  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean; maxWaitMs?: number; signal?: AbortSignal },
 ): Promise<ComboStreamPreflightResult> {
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   const isEventStream = contentType.includes("text/event-stream")
@@ -257,6 +275,10 @@ export async function preflightComboStreamResponse(
   }
 
   const reader = response.body.getReader();
+  const deadline = options?.maxWaitMs === undefined ? undefined : Date.now() + options.maxWaitMs;
+  const cancel = () => { void reader.cancel(options?.signal?.reason).catch(() => undefined); };
+  options?.signal?.addEventListener("abort", cancel, { once: true });
+  if (options?.signal?.aborted) cancel();
   const buffered: Uint8Array[] = [];
   let bufferedBytes = 0;
   let outputCommitted = false;
@@ -288,7 +310,23 @@ export async function preflightComboStreamResponse(
     for (;;) {
       let next: Awaited<ReturnType<typeof reader.read>>;
       try {
-        next = await reader.read();
+        const pending = reader.read();
+        if (deadline === undefined) next = await pending;
+        else {
+          // A slow first event is not a reason to hold a live stream: after the bound,
+          // hand the body to the relay with the read still pending.
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const result = await Promise.race([
+              pending,
+              new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now())); }),
+            ]);
+            if (result === undefined) return { kind: "accepted", response: replayBufferedResponse(response, reader, buffered, pending) };
+            next = result;
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        }
       } catch (error) {
         if (!options?.replayReadErrors) throw error;
         // The native relay still owns post-header transport failures. Preserve
@@ -322,7 +360,11 @@ export async function preflightComboStreamResponse(
         || retryableTerminalPayload?.type === "error")
         && !outputCommitted && retryableTerminalPayload) {
         await reader.cancel("retrying zero-output combo stream terminal").catch(() => undefined);
-        return { kind: "failed", response: failedTerminalResponse(response, retryableTerminalPayload, logCtx) };
+        return {
+          kind: "failed",
+          response: failedTerminalResponse(response, retryableTerminalPayload, logCtx),
+          originalResponse: replayBufferedResponse(response, reader, buffered),
+        };
       }
       if (next.done || terminalStatus !== undefined || outputCommitted
         || bufferedBytes >= COMBO_STREAM_PREFLIGHT_MAX_BYTES
@@ -331,6 +373,7 @@ export async function preflightComboStreamResponse(
       }
     }
   } finally {
+    options?.signal?.removeEventListener("abort", cancel);
     inspector.dispose();
   }
 }

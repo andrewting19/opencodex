@@ -10,9 +10,11 @@ import {
   clearCodexUpstreamHealth,
   clearThreadAccountMap,
   getCodexUpstreamHealth,
+  recordCodexUpstreamOutcome,
 } from "../../src/codex/routing";
 import type { RequestLogContext } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
+import { handleResponsesCompact } from "../../src/server/responses/compact";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -409,3 +411,195 @@ describe("Responses account usage attribution", () => {
     });
   });
 });
+
+describe("request-owned Codex account recovery", () => {
+  for (const healthyIndex of [0, 1, 2]) {
+    test(`finds healthy account ${healthyIndex + 1} when every cache says exhausted`, async () => {
+      await withPoolHome(async () => {
+        takeSpendHome();
+        const ids = ["recovery-a", "recovery-b", "recovery-c"];
+        const config = poolConfig(ids);
+        config.accountPoolStrategy = "fill-first";
+        ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 100, undefined, 100); });
+        const sends: string[] = [];
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).includes("wham")) throw new Error("quota refresh unavailable");
+          const account = new Headers(init?.headers).get("chatgpt-account-id")!;
+          sends.push(account);
+          return account === `${ids[healthyIndex]}_chatgpt` ? completedResponse("recovered")
+            : Response.json({ error: { code: "usage_limit_reached", message: "usage limit reached" } }, { status: 429 });
+        }) as typeof fetch;
+        const response = await handleResponses(request(), config, { model: "", provider: "" });
+        expect(response.status).toBe(200);
+        expect(sends).toEqual(ids.slice(0, healthyIndex + 1).map(id => `${id}_chatgpt`));
+      });
+    });
+  }
+
+  test("tries each account once when all accounts reject the request", async () => {
+    await withPoolHome(async () => {
+      takeSpendHome();
+      const ids = ["recovery-a", "recovery-b", "recovery-c"];
+      const config = poolConfig(ids);
+      config.accountPoolStrategy = "fill-first";
+      ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
+      const sends: string[] = [];
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        sends.push(new Headers(init?.headers).get("chatgpt-account-id")!);
+        return Response.json({ error: { message: "usage limit reached" } }, { status: 429 });
+      }) as typeof fetch;
+      const response = await handleResponses(request(), config, { model: "", provider: "" });
+      expect(response.status).toBe(429);
+      expect(sends).toEqual(ids.map(id => `${id}_chatgpt`));
+    });
+  });
+
+  for (const committed of [false, true]) {
+    test(`${committed ? "keeps" : "recovers"} a quota SSE failure ${committed ? "after" : "before"} output`, async () => {
+      await withPoolHome(async () => {
+        takeSpendHome();
+        const ids = ["stream-a", "stream-b", "stream-c"];
+        const config = poolConfig(ids);
+        config.accountPoolStrategy = "fill-first";
+        ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
+        const sends: string[] = [];
+        globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const id = new Headers(init?.headers).get("chatgpt-account-id")!;
+          sends.push(id);
+          if (id === "stream-c_chatgpt") return completedResponse("recovered");
+          const events: unknown[] = [{ type: "response.created", response: { id: "failed-turn" } }];
+          if (committed) events.push({ type: "response.output_item.added", item: { type: "function_call", name: "write_file", call_id: "call_1", arguments: "{}" } });
+          events.push({ type: "response.failed", response: { status: "failed", error: { code: "usage_limit_reached", message: "usage limit reached" } } });
+          return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+        }) as typeof fetch;
+        const response = await handleResponses(request(), config, { model: "", provider: "" });
+        await response.text();
+        expect(sends).toEqual((committed ? ids.slice(0, 1) : ids).map(id => `${id}_chatgpt`));
+        expect(response.status).toBe(200);
+      });
+    });
+  }
+
+  test("does not send twice to duplicate stored subscriptions", async () => {
+    await withPoolHome(async () => {
+      takeSpendHome();
+      const ids = ["duplicate-a", "duplicate-b", "healthy-c"];
+      const config = poolConfig(ids);
+      config.accountPoolStrategy = "fill-first";
+      ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
+      saveCodexAccountCredential("duplicate-b", {
+        accessToken: "duplicate-rotated-token", refreshToken: "duplicate-refresh", expiresAt: Date.now() + 300_000,
+        chatgptAccountId: "duplicate-a_chatgpt",
+      });
+      const sends: string[] = [];
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const id = new Headers(init?.headers).get("chatgpt-account-id")!;
+        sends.push(id);
+        return id === "healthy-c_chatgpt" ? completedResponse("recovered")
+          : Response.json({ error: { message: "usage limit reached" } }, { status: 429 });
+      }) as typeof fetch;
+      const response = await handleResponses(request(), config, { model: "", provider: "" });
+      expect(response.status).toBe(200);
+      expect(sends).toEqual(["duplicate-a_chatgpt", "healthy-c_chatgpt"]);
+    });
+  });
+});
+
+test("a request-owned main credential can fail over through the full Pool", async () => {
+  await withPoolHome(async () => {
+    takeSpendHome();
+    const config = poolConfig(["caller-a", "caller-b"]);
+    config.accountPoolStrategy = "fill-first";
+    config.activeCodexAccountId = MAIN_CODEX_ACCOUNT_ID;
+    config.activeCodexAccountPinned = MAIN_CODEX_ACCOUNT_ID;
+    updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 0);
+    for (const id of ["caller-a", "caller-b"]) { savePoolCredential(id); updateAccountQuota(id, 0); }
+    const sends: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const account = new Headers(init?.headers).get("chatgpt-account-id")!;
+      sends.push(account);
+      return account === "caller-b_chatgpt" ? completedResponse("recovered")
+        : Response.json({ error: { message: "usage limit reached" } }, { status: 429 });
+    }) as typeof fetch;
+    const req = request();
+    req.headers.set("authorization", "Bearer caller-owned-access");
+    req.headers.set("chatgpt-account-id", "caller-owned-chatgpt");
+    const response = await handleResponses(req, config, { model: "", provider: "" });
+    expect(response.status).toBe(200);
+    expect(sends).toEqual(["caller-owned-chatgpt", "caller-a_chatgpt", "caller-b_chatgpt"]);
+  });
+});
+
+test("each account can refresh its own token before recovery reaches the third account", async () => {
+  await withPoolHome(async () => {
+    takeSpendHome();
+    const ids = ["refresh-a", "refresh-b", "refresh-c"];
+    const config = poolConfig(ids);
+    config.accountPoolStrategy = "fill-first";
+    ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
+    const sends: string[] = [];
+    const refreshes: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/oauth/token")) {
+        const grant = new URLSearchParams(String(init?.body)).get("refresh_token")!;
+        refreshes.push(grant);
+        const id = grant.replace(/-refresh-token$/, "");
+        return Response.json({ access_token: `${id}-renewed`, refresh_token: grant, expires_in: 3600 });
+      }
+      const auth = new Headers(init?.headers).get("authorization")!;
+      sends.push(auth);
+      if (auth === "Bearer refresh-c-access-token") return completedResponse("recovered");
+      return Response.json({ error: { message: auth.endsWith("renewed") ? "usage limit reached" : "invalid token" } }, { status: auth.endsWith("renewed") ? 429 : 401 });
+    }) as typeof fetch;
+    const response = await handleResponses(request(), config, { model: "", provider: "" });
+    expect(response.status).toBe(200);
+    expect(sends).toEqual(["Bearer refresh-a-access-token", "Bearer refresh-a-renewed", "Bearer refresh-b-access-token", "Bearer refresh-b-renewed", "Bearer refresh-c-access-token"]);
+    expect(refreshes).toEqual(["refresh-a-refresh-token", "refresh-b-refresh-token"]);
+  });
+});
+
+test("recovery can probe an untried account with a due reset-derived cooldown", async () => {
+  await withPoolHome(async () => {
+    takeSpendHome();
+    const ids = ["probe-a", "probe-b", "probe-c"];
+    const config = poolConfig(ids);
+    config.accountPoolStrategy = "fill-first";
+    ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
+    recordCodexUpstreamOutcome(config, "probe-c", 429, {
+      now: Date.now() - 6 * 60_000, resetAt: String(Math.floor(Date.now() / 1000) + 3600), modelId: "gpt-5.5",
+    });
+    const sends: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const account = new Headers(init?.headers).get("chatgpt-account-id")!;
+      sends.push(account);
+      return account === "probe-c_chatgpt" ? completedResponse("recovered")
+        : Response.json({ error: { message: "usage limit reached" } }, { status: 429 });
+    }) as typeof fetch;
+    const response = await handleResponses(request(), config, { model: "", provider: "" });
+    expect(response.status).toBe(200);
+    expect(sends).toEqual(ids.map(id => `${id}_chatgpt`));
+  });
+});
+
+for (const status of [429, 502]) {
+  test(`native compaction reaches the third account after ${status} quota failures`, async () => {
+    await withPoolHome(async () => {
+      takeSpendHome();
+      const ids = ["compact-a", "compact-b", "compact-c"];
+      const config = poolConfig(ids);
+      config.accountPoolStrategy = "fill-first";
+      ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 100); });
+      const sends: string[] = [];
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const account = new Headers(init?.headers).get("chatgpt-account-id")!;
+        sends.push(account);
+        return account === "compact-c_chatgpt" ? completedResponse("compacted")
+          : Response.json({ error: { message: "usage limit reached" } }, { status });
+      }) as typeof fetch;
+      const req = new Request("http://localhost/v1/responses/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-5.5", input: "hello" }) });
+      const response = await handleResponsesCompact(req, config, { model: "", provider: "" });
+      expect(response.status).toBe(200);
+      expect(sends).toEqual((status === 502 ? [ids[0], ids[0], ...ids] : ids).map(id => `${id}_chatgpt`));
+    });
+  });
+}

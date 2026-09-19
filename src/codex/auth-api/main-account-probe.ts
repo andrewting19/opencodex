@@ -1,4 +1,4 @@
-import { parseMainPolicyUsageQuota, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
+import { captureCodexQuotaObservation, isCodexQuotaObservationCurrent, parseMainPolicyUsageQuota, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
 import type { StoredAccountQuota, WhamUsageResponse } from "../quota";
 import { reconcileMainCodexAccountRuntimeState } from "../account-lifecycle";
 import { getMainChatgptAccountId, readCodexTokensResult } from "../auth-collision";
@@ -218,6 +218,7 @@ export async function fetchMainAccountInfoWhileOwned(
   let quotaRefreshGeneration = captureMainAccountIdentityGeneration();
   try {
     const dispatchSequence = nextQuotaDispatchSequence();
+    const quotaObservation = captureCodexQuotaObservation();
     const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
       headers: { Authorization: `Bearer ${tokens.access_token}`, "ChatGPT-Account-Id": tokens.account_id },
       signal: quotaSignal,
@@ -255,7 +256,8 @@ export async function fetchMainAccountInfoWhileOwned(
     }
     // Check after body/retry awaits and before any cache, credits, policy or
     // Reserve publication. Returning cached state supplies no fresh recovery proof.
-    if (!isQuotaDispatchCurrent(dispatchSequence)) {
+    if (!isQuotaDispatchCurrent(dispatchSequence)
+      || !isCodexQuotaObservationCurrent(MAIN_CODEX_ACCOUNT_ID, quotaObservation)) {
       return { info: getMainAccountInfoCache() ?? EMPTY_MAIN_ACCOUNT_INFO,
         credentialChecked: true, hasCredential: true };
     }
@@ -296,9 +298,9 @@ export async function fetchMainAccountInfoWhileOwned(
     // Mirror main quota + plan into the shared stores so the rotation engine can
     // score and auto-switch the main account exactly like a pool account (Option A).
     setMainAccountPlan(result.plan);
-    if (result.quota) {
-      setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, undefined, usage);
-    }
+    const quotaCommitted = result.quota
+      ? setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, undefined, usage, quotaObservation)
+      : false;
     publishQuotaDispatch(dispatchSequence);
     return {
       info: result,
@@ -306,8 +308,8 @@ export async function fetchMainAccountInfoWhileOwned(
       quotaRefreshGeneration,
       credentialChecked: true,
       hasCredential: true,
-      ...(quota ? { freshQuota: quota } : {}),
-      ...(quota && mainQuotaWriter && isMainQuotaWriterLive(mainQuotaWriter)
+      ...(quota && quotaCommitted ? { freshQuota: quota } : {}),
+      ...(quota && quotaCommitted && mainQuotaWriter && isMainQuotaWriterLive(mainQuotaWriter)
         && mainQuotaCredentialGeneration === getMainQuotaCredentialGeneration()
         && matchesMainQuotaCredential(tokens.access_token, tokens.account_id)
         ? { resetRecoveryProof: { writer: mainQuotaWriter, credentialGeneration: mainQuotaCredentialGeneration, dispatchSequence } }

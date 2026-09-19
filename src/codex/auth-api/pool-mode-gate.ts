@@ -1,5 +1,5 @@
 import { getCodexAccountCredential, getValidCodexToken, readCodexAccountRecord } from "../account-store";
-import { getAccountQuota, isCompleteCodexQuotaRecoverySnapshot } from "../quota";
+import { codexQuotaUsageObservedAt, getAccountQuota, isCompleteCodexQuotaRecoverySnapshot } from "../quota";
 import { reconcileMainCodexAccountRuntimeState } from "../account-lifecycle";
 import { claimDueCodexQuotaRecoveryProbes, settleCodexQuotaRecoveryProbe } from "../routing";
 import { readCodexTokens } from "../auth-collision";
@@ -180,7 +180,7 @@ export async function primeCodexPoolQuotas(
     const pool = (runtimeConfig.codexAccounts ?? []).filter(isSelectableCodexPoolAccount);
     const stale = pool.filter(a => {
       const q = getAccountQuota(a.id);
-      if (q) return Date.now() - q.updatedAt >= POOL_CACHE_TTL;
+      if (q) return Date.now() - codexQuotaUsageObservedAt(q) >= POOL_CACHE_TTL;
       // No stored quota: either never primed, or the last attempt failed. Retry only
       // once per TTL window so an unreachable or rejecting account cannot turn every
       // prime trigger into another upstream request.
@@ -204,7 +204,7 @@ export async function primeCodexPoolQuotas(
             // exhausted across traffic. Re-read on the same TTL the pool rows
             // already honor.
             const existingMainQuota = getAccountQuota(MAIN_CODEX_ACCOUNT_ID);
-            if (existingMainQuota && Date.now() - existingMainQuota.updatedAt < POOL_CACHE_TTL) return;
+            if (existingMainQuota && Date.now() - codexQuotaUsageObservedAt(existingMainQuota) < POOL_CACHE_TTL) return;
             if (!(options.readMainTokens ?? readCodexTokens)()) return;
             if (options.fetchMainInfo) await options.fetchMainInfo(false);
             else await fetchMainAccountInfoAttempt(false, 1, mainLease, true);
