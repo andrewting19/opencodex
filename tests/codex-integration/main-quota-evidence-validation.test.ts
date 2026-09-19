@@ -163,9 +163,9 @@ describe("cold partial writers hydrate only the surviving legacy cache", () => {
         else updateAccountQuota(MAIN, undefined, undefined, undefined, undefined, 0);
         expect(getAccountQuota(MAIN)).toEqual(expired
           ? { resetCredits: 0, updatedAt: expect.any(Number) }
-          : { ...quota, resetCredits: 0, updatedAt: expect.any(Number) });
+          : { ...quota, weeklyObservedAt: quota.updatedAt, monthlyObservedAt: quota.updatedAt, resetCredits: 0, updatedAt: expect.any(Number) });
         if (writerKind === "parsed") {
-          expect(getMainPolicyQuota()).toEqual({ ...quota, resetCredits: 0, updatedAt: expect.any(Number) });
+          expect(getMainPolicyQuota()).toEqual({ ...quota, weeklyObservedAt: quota.updatedAt, monthlyObservedAt: quota.updatedAt, resetCredits: 0, updatedAt: expect.any(Number) });
         } else expect(getMainPolicyQuota()).toBeNull();
       });
     }

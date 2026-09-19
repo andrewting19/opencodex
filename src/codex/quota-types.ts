@@ -1,6 +1,9 @@
 /** Quota wire/storage shapes. This leaf must not import credential or config owners. */
 export type StoredAccountQuota = {
   weeklyPercent?: number;
+  /** Observation clocks belong to individual windows, never to carried values. */
+  weeklyObservedAt?: number;
+  monthlyObservedAt?: number;
   monthlyPercent?: number;
   weeklyResetAt?: number;
   monthlyResetAt?: number;

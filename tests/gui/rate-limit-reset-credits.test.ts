@@ -353,6 +353,7 @@ describe("rate-limit reset credits", () => {
       expect(quota).toEqual({ monthlyPercent: 100, monthlyResetAt: 1787401330, monthlyIsPrimaryWindow: true });
       setAccountQuotaFromParsed("monthly-A", quota!);
       expect(getAccountQuota("monthly-A")).toEqual({
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 100,
         monthlyResetAt: 1787401330,
         monthlyIsPrimaryWindow: true,
@@ -370,6 +371,7 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("monthly-A", headers);
       expect(getAccountQuota("monthly-A")).toEqual({
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 100,
         monthlyResetAt: 1787401330,
         monthlyIsPrimaryWindow: true,
@@ -386,6 +388,7 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("weekly-A", headers);
       expect(getAccountQuota("weekly-A")).toEqual({
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 80,
         weeklyResetAt: 1787000000,
         updatedAt: expect.any(Number),
@@ -401,8 +404,10 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("credits-A", headers);
       expect(getAccountQuota("credits-A")).toEqual({
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 80,
         weeklyResetAt: 1787000000,
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 20,
         monthlyResetAt: 222,
         resetCredits: 3,
@@ -421,6 +426,7 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("team-tertiary", headers);
       expect(getAccountQuota("team-tertiary")).toEqual({
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 39,
         monthlyResetAt: 1787401330,
         monthlyIsPrimaryWindow: true,
@@ -434,8 +440,10 @@ describe("rate-limit reset credits", () => {
       const quota = parseUsageQuota({ rate_limit_reset_credits: { available_count: 2 } });
       setAccountQuotaFromParsed("credits-only", quota!);
       expect(getAccountQuota("credits-only")).toEqual({
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 10,
         weeklyResetAt: 111,
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 20,
         monthlyResetAt: 222,
         resetCredits: 2,
@@ -453,8 +461,10 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("weekly-only", headers);
       expect(getAccountQuota("weekly-only")).toEqual({
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 80,
         weeklyResetAt: 1787000000,
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 50,
         monthlyResetAt: 222,
         updatedAt: expect.any(Number),
@@ -472,9 +482,11 @@ describe("rate-limit reset credits", () => {
       });
       applyAccountQuotaFromUpstreamHeaders("team-A", headers);
       expect(getAccountQuota("team-A")).toEqual({
+        monthlyObservedAt: expect.any(Number),
         monthlyPercent: 39,
         monthlyResetAt: 1787401330,
         monthlyIsPrimaryWindow: true,
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 20,
         weeklyResetAt: 1787000000,
         updatedAt: expect.any(Number),
@@ -503,6 +515,7 @@ describe("rate-limit reset credits", () => {
       applyAccountQuotaFromUpstreamHeaders("burst-A", headers);
       const stored = getAccountQuota("burst-A");
       expect(stored).toEqual({
+        weeklyObservedAt: expect.any(Number),
         shortPercent: 97,
         shortResetAt: 1787401330,
         shortObservedAt: expect.any(Number),
@@ -559,6 +572,7 @@ describe("rate-limit reset credits", () => {
         "x-codex-primary-reset-at": "1787000000",
       }));
       expect(getAccountQuota("legacy-A")).toEqual({
+        weeklyObservedAt: expect.any(Number),
         weeklyPercent: 80,
         weeklyResetAt: 1787000000,
         updatedAt: expect.any(Number),

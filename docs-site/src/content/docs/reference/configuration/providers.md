@@ -465,12 +465,32 @@ separates new/unbound assignment, usage-based proactive switching, and failure r
 normally keeps affinity, but `quota` may rebind it on its next request after the usage threshold is
 crossed, while pause, cooldown, reauthentication, and failure handling can clear or move routing
 independently. An unbound request has no live account binding; this can include an existing visible
-task after proxy restart or affinity reset. A pre-stream 429 or 402, or a 5xx response whose bounded
-body explicitly reports quota exhaustion, retries once on an eligible alternate account in the same
-request, even when usage-based proactive switching is off. The ordinary transient-5xx policy runs
-first, so a wrapped quota response may make up to three sends on the exhausted account before pool
-rotation. Account changes preserve and replay the conversation context, but provider-side
-prompt-cache reuse across accounts is not guaranteed and the cache may need to warm again.
+task after proxy restart or affinity reset.
+
+Each Pool request keeps its own list of attempted accounts. A pre-stream 429 or 402, or a bounded
+5xx body that reports quota exhaustion, moves to the next eligible account. Recovery continues
+until an account serves the request, all eligible accounts have been considered, the caller cancels,
+or the two-minute recovery budget ends. This also applies to native compaction. The caller's native
+credential can participate without being stored. Duplicate subscriptions do not receive separate
+attempts. A stored account can refresh its token once after a 401; this does not spend another
+account's refresh budget. Exact account selectors, Direct mode, pauses, model access rules, Reserve
+rules, and explicit `Retry-After` waits remain in force.
+
+Quota cache values rank accounts. They cannot, by themselves, prevent recovery from trying an
+eligible account. Each standard usage window has its own observation time. Partial headers and
+credit updates retain the age of values they carry. A complete usage response replaces obsolete
+windows. A delayed usage poll cannot overwrite newer header evidence or provide fresh recovery
+proof. Reset-derived cooldowns allow only the existing bounded recovery probes.
+
+For HTTP and WebSocket response streams, recovery can handle a quota error after lifecycle events
+but before output starts. A text, reasoning, tool, or unknown event ends this recovery window.
+The proxy never restarts a request after such an event. Recovery after output needs a checkpoint
+in the client turn controller. Encrypted tool history retains its separate decryption recovery path.
+The stream check is bounded by memory and time; if a bound is reached, normal streaming takes over.
+
+The ordinary transient-5xx policy still runs first, so a wrapped quota response can make up to three
+sends on the first account before rotation. Account changes preserve the conversation context, but
+provider prompt-cache reuse across accounts is not guaranteed.
 
 On a **401/403**, App login clears that account's process-local affinity and requires reauthentication.
 On a **429**, opencodex honors `Retry-After`, starts the account cooldown, clears affinity, and may

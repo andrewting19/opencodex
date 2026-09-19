@@ -28,7 +28,7 @@ import {
 } from "../../src/codex/native-profile-startup";
 import { handleNativeProfileAPI } from "../../src/codex/native-profile-api";
 import type { NativeProfileManager } from "../../src/codex/native-profile-manager";
-import { resolveCodexAccountForThread, clearThreadAccountMap } from "../../src/codex/routing";
+import { computeCodexUsageScore, resolveCodexAccountForThread, clearThreadAccountMap } from "../../src/codex/routing";
 import {
   acquireNativeMainProfileDrain,
   getNativeMainProfileRequestCount,
@@ -36,7 +36,7 @@ import {
 } from "../../src/server/lifecycle";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
-import { getMainPolicyQuota, setAccountQuotaFromParsed } from "../../src/codex/quota";
+import { applyAccountQuotaFromUpstreamHeaders, captureCodexQuotaObservation, codexQuotaUsageObservedAt, getMainPolicyQuota, setAccountQuotaFromParsed } from "../../src/codex/quota";
 
 // Phase 20 (260630_wsl-account-autoswitch): startup/lazy quota priming.
 
@@ -78,7 +78,7 @@ function seedPoolAccount(config: OcxConfig, id: string, plan?: string): void {
 function whamResponse(weekly: number) {
   return new Response(JSON.stringify({
     rate_limit: {
-      secondary_window: { used_percent: weekly, reset_at: 1782000000 },
+      secondary_window: { used_percent: weekly, reset_at: Math.floor(Date.now() / 1000) + 604800 },
     },
   }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
@@ -153,6 +153,47 @@ describe("primeCodexPoolQuotas", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("partial and credit updates keep each carried window's original age", () => {
+    const old = Date.now() - 6 * 60_000;
+    setAccountQuotaFromParsed("dated", { weeklyPercent: 100, monthlyPercent: 100 }, undefined, undefined, undefined, undefined,
+      { ...captureCodexQuotaObservation(), observedAt: old });
+    setAccountQuotaFromParsed("dated", { weeklyPercent: 20 });
+    setAccountQuotaFromParsed("dated", { resetCredits: 3 });
+    const quota = getAccountQuota("dated")!;
+    expect(quota.monthlyObservedAt).toBe(old);
+    expect(quota.weeklyObservedAt).toBeGreaterThan(old);
+    expect(codexQuotaUsageObservedAt(quota)).toBe(old);
+    expect(computeCodexUsageScore(quota)).toBe(20);
+  });
+
+  test("a delayed WHAM response cannot overwrite later header evidence or provide recovery proof", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, "ordered");
+    updateAccountQuota("ordered", 80);
+    let release!: (response: Response) => void;
+    let dispatched!: () => void;
+    const started = new Promise<void>(resolve => { dispatched = resolve; });
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (() => { dispatched(); return new Promise<Response>(resolve => { release = resolve; }); }) as typeof fetch;
+      const pending = fetchPoolAccountQuota("ordered", true, "pro");
+      await started;
+      applyAccountQuotaFromUpstreamHeaders("ordered", new Headers({ "x-codex-primary-used-percent": "10" }));
+      release(whamResponse(100));
+      const result = await pending;
+      expect(result.quota?.weeklyPercent).toBe(10);
+      expect(result.freshQuota).toBeUndefined();
+      expect(result.freshCredentialGeneration).toBeUndefined();
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  test("clearing quota fences an older in-flight observation", () => {
+    const observation = captureCodexQuotaObservation();
+    clearAccountQuota("cleared");
+    expect(setAccountQuotaFromParsed("cleared", { weeklyPercent: 100 }, undefined, undefined, undefined, undefined, observation)).toBe(false);
+    expect(getAccountQuota("cleared")).toBeNull();
   });
 
   test("a complete weekly WHAM refresh retires obsolete monthly and burst windows and restores the third account", async () => {

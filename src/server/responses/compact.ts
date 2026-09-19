@@ -1,3 +1,4 @@
+import { CodexAccountAttempts, resolveAvailableCodexAuthContext } from "../../codex/account-attempts";
 import type { Server } from "bun";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import {
@@ -49,7 +50,6 @@ import {
   headersForCodexAuthContext,
   materializeCodexUpstreamAuthAsync,
   isCodexAuthContextUsable,
-  resolveCodexAuthContext,
   codexProbeLeaseId,
   codexProbeQuotaScope,
   releaseCodexAuthContextProbeLease,
@@ -154,6 +154,7 @@ import {
   preAuthUpstreamHostCircuitKey,
   upstreamHostCircuitOpenResponse,
   usesCodexForwardPoolAuth,
+  shouldRetryCodexPoolAccountQuota,
 } from "./core";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
@@ -405,24 +406,29 @@ async function resolveAlternateCompactContext(args: {
   route: { provider: OcxProviderConfig; codexAccountMode?: CodexAccountMode };
   selectedModelId: string | undefined;
   excludeAccountId: string | null;
+  attempts: CodexAccountAttempts;
   turnAdmissionLease?: AdmissionLease;
   admission?: DataPlaneAdmission;
 }): Promise<{ authCtx: CodexAuthContext; provider: OcxProviderConfig; headers: Headers } | null> {
   const { req, config, route, selectedModelId, excludeAccountId, turnAdmissionLease } = args;
-  if (!route.codexAccountMode || !excludeAccountId) return null;
+  if (!route.codexAccountMode) return null;
   try {
-    const authCtx = await resolveCodexAuthContext(req.headers, config, route.codexAccountMode, {
+    while (args.attempts.remainingMs() > 0 && !req.signal.aborted) {
+    const authCtx = await resolveAvailableCodexAuthContext(req.headers, config, route.codexAccountMode, {
       admission: args.admission,
       ...(selectedModelId ? { modelId: selectedModelId } : {}),
-      excludeAccountId,
+      excludeAccountId: excludeAccountId ?? "__main__",
+      excludedAccountIds: args.attempts.excludedAccountIds,
+      callerAlreadyAttempted: args.attempts.callerAlreadyAttempted,
+      signal: AbortSignal.any([req.signal, AbortSignal.timeout(args.attempts.remainingMs())]),
       requestScopedMainCredential: hasForwardableCodexBearer(req.headers, config),
       beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
     });
-    // Caller-owned main has no Pool account id. It is still a valid one-shot alternate after a
+    // Caller-owned main has no Pool account id. It is still a valid alternate after a
     // stored account fails; resolveCodexAuthContext already prevents returning it when main is the
     // excluded credential.
     if (authCtx.accountId === excludeAccountId) return null;
-    const provider = applyCodexAuthContextToProvider(route.provider, authCtx, route.codexAccountMode);
+    const provider = applyCodexAuthContextToProvider(stripCodexRuntimeProviderFields(route.provider), authCtx, route.codexAccountMode);
     const headers = new Headers({ "content-type": "application/json" });
     const selected = headersForCodexAuthContext(req.headers, authCtx, config, selectedModelId, args.admission);
     for (const name of FORWARD_HEADERS) {
@@ -435,7 +441,10 @@ async function resolveAlternateCompactContext(args: {
       headers.set("chatgpt-account-id", override.chatgptAccountId);
     }
     if (provider.apiKey) headers.set("authorization", `Bearer ${resolveProviderApiKey(provider.apiKey)}`);
-    return { authCtx, provider, headers };
+    if (args.attempts.visit(authCtx, headers)) return { authCtx, provider, headers };
+    releaseCodexAuthContextProbeLease(authCtx);
+    }
+    return null;
   } catch (err) {
     if (err instanceof CodexMainProfileDrainingError) {
       // The native-main fence can start after account A has already rejected the
@@ -688,7 +697,7 @@ export async function handleResponsesCompact(
     let headers = new Headers({ "content-type": "application/json" });
     try {
       if (route.codexAccountMode || customReserveForward) {
-        if (route.codexAccountMode) authCtx = await resolveCodexAuthContext(req.headers, config, route.codexAccountMode, {
+        if (route.codexAccountMode) authCtx = await resolveAvailableCodexAuthContext(req.headers, config, route.codexAccountMode, {
           admission,
           accountId: route.codexAccountId,
           modelId: selectedModelId,
@@ -816,21 +825,23 @@ export async function handleResponsesCompact(
     // wrapping reset retry — because those retries happen before any alternate is even
     // considered. The alternate is one bounded send: a second ladder would multiply the
     // work an already-rejecting pool is doing.
+    const codexAttempts = new CodexAccountAttempts();
+    codexAttempts.visit(authCtx, headers);
     const sendCompactAttempt = (
       sendProvider: OcxProviderConfig,
       sendHeaders: Headers,
       recovery: "normal" | "single",
       sendAuthCtx: CodexAuthContext,
     ): Promise<Response> => {
-      const doFetch = (upstreamRecovery?: UpstreamSendRecovery) => fetchWithHeaderTimeout(
+      const doFetch = (upstreamRecovery?: UpstreamSendRecovery, signal = req.signal) => fetchWithHeaderTimeout(
         compactUrl,
         applyUpstreamRecoveryInit({
           method: "POST",
           headers: sendHeaders,
           body: JSON.stringify({ ...compactBody, model: route.modelId }),
         }, upstreamRecovery),
-        req.signal,
-        connectMs,
+        signal,
+        recovery === "single" ? Math.min(connectMs, codexAttempts.remainingMs()) : connectMs,
         false,
         providerFetch(sendProvider, undefined, {
           providerName: route.providerName,
@@ -848,7 +859,7 @@ export async function handleResponsesCompact(
         return res;
       });
       return recovery === "single"
-        ? doFetch()
+        ? codexAttempts.run(req.signal, signal => doFetch(undefined, signal))
         : fetchWithTransientRetry(doFetch, { abortSignal: req.signal, label: safeHostLabel(compactUrl) });
     };
 
@@ -899,10 +910,13 @@ export async function handleResponsesCompact(
       return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
     }
 
+    compactAccountRecovery: for (;;) {
+    let refreshFailed = false;
     if (
       upstream.status === 401
       && (authCtx.kind === "main-pool" || authCtx.kind === "pool")
       && usesCodexForwardPoolAuth(authCtx, compactProvider)
+      && codexAttempts.refreshOnce(authCtx)
       && !req.signal.aborted
     ) {
       await upstream.body?.cancel().catch(() => undefined);
@@ -946,40 +960,40 @@ export async function handleResponsesCompact(
               credentialGeneration: poolReplay.quarantineGeneration ?? poolAuthCtx.generation,
             });
           }
-          return replay.response;
         }
         recordCompactPoolOutcome(outcomeCtx, replay.response.status === 401 ? 401 : "connect_neutral");
-        return replay.response;
-      }
-      authCtx = replay.authCtx;
-      outcomeCtx = replay.authCtx;
-      compactProvider = replay.provider;
-      headers = replay.headers;
-      logCtx.accountLogLabel = codexAuthContextLogLabel(replay.authCtx, config);
-      try {
-        upstream = await sendCompactAttempt(compactProvider, headers, "single", authCtx);
-      } catch (err) {
-        if (req.signal.aborted) {
-          recordCompactPoolOutcome(outcomeCtx, 499);
-          return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+        upstream = replay.response;
+        refreshFailed = true;
+      } else {
+        authCtx = replay.authCtx;
+        outcomeCtx = replay.authCtx;
+        compactProvider = replay.provider;
+        headers = replay.headers;
+        logCtx.accountLogLabel = codexAuthContextLogLabel(replay.authCtx, config);
+        try {
+          upstream = await sendCompactAttempt(compactProvider, headers, "single", authCtx);
+        } catch (err) {
+          if (req.signal.aborted) {
+            recordCompactPoolOutcome(outcomeCtx, 499);
+            return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+          }
+          const localRefusal = localDispatchRefusal(err);
+          if (localRefusal) return localRefusal;
+          recordCompactPoolOutcome(outcomeCtx, classifyTransportFailureKind(err));
+          return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
         }
-        const localRefusal = localDispatchRefusal(err);
-        if (localRefusal) return localRefusal;
-        recordCompactPoolOutcome(outcomeCtx, classifyTransportFailureKind(err));
-        return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
       }
     }
 
-    // Bounded same-request alternate: the regular /v1/responses path already does this
-    // (core.ts:319-423) and recognizes exactly 429/402. Without it a pool rejection
-    // surfaces to the client, which retries the compact task OUTSIDE the logical request
-    // — reporting exhausted retries while another pool account sat idle (#913).
+    // Share the request attempt list with Responses: each eligible identity is tried once.
+    const accountQuotaFailure = await shouldRetryCodexPoolAccountQuota(upstream, req.signal);
     if (
-      (upstream.status === 429 || upstream.status === 402)
-      && !storedPool401ReplayAttempted
-      && usesCodexForwardPoolAuth(authCtx, route.provider)
-      && !authCtx.fixedAccount
-      && route.codexAccountMode
+      (accountQuotaFailure || upstream.status === 401 || refreshFailed)
+      && (usesCodexForwardPoolAuth(authCtx, route.provider)
+        || (authCtx.kind === "main" && !authCtx.reserveAuthorization))
+      && !(authCtx.kind !== "main" && authCtx.fixedAccount)
+      && route.codexAccountMode === "pool" && route.codexAccountId === undefined
+      && codexAttempts.remainingMs() > 0
       && !req.signal.aborted
     ) {
       const firstRetryAfter = upstream.headers.get("retry-after");
@@ -997,6 +1011,7 @@ export async function handleResponsesCompact(
         route,
         selectedModelId,
         excludeAccountId: authCtx.accountId,
+        attempts: codexAttempts,
         turnAdmissionLease,
       });
       // Resolution can await a credential refresh, so the client may have gone away
@@ -1023,12 +1038,15 @@ export async function handleResponsesCompact(
             { modelId: route.modelId },
           );
         }
-        recordCompactPoolOutcome(authCtx, upstream.status, {
+        recordCompactPoolOutcome(authCtx, accountQuotaFailure && upstream.status >= 500 ? 429 : upstream.status, {
           retryAfter: firstRetryAfter,
           resetAt: firstResetAt,
           ...(alternate.authCtx.accountId ? { promoteAccountId: alternate.authCtx.accountId } : {}),
         });
         await upstream.body?.cancel().catch(() => undefined);
+        authCtx = alternate.authCtx;
+        compactProvider = alternate.provider;
+        headers = alternate.headers;
         outcomeCtx = alternate.authCtx;
         logCtx.accountLogLabel = codexAuthContextLogLabel(alternate.authCtx, config);
         try {
@@ -1059,8 +1077,12 @@ export async function handleResponsesCompact(
           recordCompactPoolOutcome(outcomeCtx, outcome);
           return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
         }
+        continue compactAccountRecovery;
       }
     }
+    break;
+    }
+
     const retryAfter = upstream.headers.get("retry-after");
     const resetAt = [
       upstream.headers.get("x-codex-primary-reset-at"),

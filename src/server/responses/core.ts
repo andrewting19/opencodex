@@ -1,3 +1,4 @@
+import { CodexAccountAttempts, resolveAvailableCodexAuthContext } from "../../codex/account-attempts";
 import type { Server } from "bun";
 import { randomUUID } from "node:crypto";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
@@ -171,7 +172,6 @@ import {
   headersForCodexAuthContext,
   materializeCodexUpstreamAuthAsync,
   isCodexAuthContextUsable,
-  resolveCodexAuthContext,
   codexProbeLeaseId,
   codexProbeQuotaScope,
   releaseCodexAuthContextProbeLease,
@@ -1097,7 +1097,7 @@ async function shouldRetryCodexPoolAccountModel400(
   }
 }
 
-/** Pre-stream quota/billing rejections that warrant one alternate-account attempt (#584). */
+/** Pre-stream quota/billing rejections that permit another eligible account attempt. */
 function codexQuotaFailureMessage(body: string): string | undefined {
   try {
     const payload = JSON.parse(body) as unknown;
@@ -1157,18 +1157,10 @@ interface CodexPoolAccountRetryArgs {
     turnAdmissionLease?: AdmissionLease;
     resolveCodexModelEntitlements?: typeof resolveCodexModelEntitlements;
   };
-  firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" }>;
+  firstAuthCtx: CodexAuthContext;
+  attempts: CodexAccountAttempts;
   firstResponse: Response;
   outcomeStatus: number;
-  /**
-   * Forbid resolving a DIFFERENT account for this retry.
-   *
-   * Set when a stored Pool 401 already spent this logical request's account budget on its own
-   * refresh and replay. The same-account gated-model retry above stays available, because it
-   * sends to the account that was already paying; only the alternate-account resolution below is
-   * out of budget.
-   */
-  sameAccountOnly?: boolean;
   upstream: AbortController;
   connectMs: number;
   passthroughEstimate?: number;
@@ -1295,7 +1287,7 @@ function shouldDeferCodexResetDerivedCooldown(response: Response, enabled?: bool
 }
 
 /**
- * One bounded alternate-account retry for Codex pool auth. Used for allow-listed
+ * Select the next untried credential for this request before any output is relayed. Used for allow-listed
  * model-400 and for pre-stream 429/402 quota failures (#584).
  */
 async function retryCodexPoolOnAlternateAccount(
@@ -1308,7 +1300,8 @@ async function retryCodexPoolOnAlternateAccount(
   const inboundWire = options.inboundWire ?? "responses";
   const entitlementResolver = options.resolveCodexModelEntitlements ?? resolveCodexModelEntitlements;
   let retryAuthCtx: CodexAuthContext | undefined;
-  if (outcomeStatus === 400 && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId)) {
+  if (firstAuthCtx.kind !== "main" && outcomeStatus === 400
+    && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId) && args.attempts.retryModelOnce(firstAuthCtx)) {
     invalidateCodexModelEntitlementsForAccount(firstAuthCtx.accountId);
     let refreshed;
     try {
@@ -1331,24 +1324,30 @@ async function retryCodexPoolOnAlternateAccount(
   }
   // Exact account selectors may retry the same confirmed account above, but must never resolve
   // an alternate. Quota failures and a refreshed entitlement miss remain terminal.
-  if (!retryAuthCtx && (firstAuthCtx.fixedAccount || args.sameAccountOnly === true)) {
+  if (!retryAuthCtx && isFixedCodexAccount(firstAuthCtx)) {
     return { kind: "no-alternate" };
   }
   try {
-    retryAuthCtx ??= await resolveCodexAuthContext(
-        callerAuthHeaders,
-        config,
-        "pool",
-        {
-          excludeAccountId: firstAuthCtx.accountId,
+    while (!retryAuthCtx && args.attempts.remainingMs() > 0 && !upstream.signal.aborted) {
+      const candidate = await resolveAvailableCodexAuthContext(
+        callerAuthHeaders, config, "pool", {
+          excludeAccountId: firstAuthCtx.accountId ?? MAIN_CODEX_ACCOUNT_ID,
+          excludedAccountIds: args.attempts.excludedAccountIds,
+          callerAlreadyAttempted: args.attempts.callerAlreadyAttempted,
           admission: options.admission,
           codexAuthPolicy: options.codexAuthPolicy,
           modelId: route.modelId,
           requestScopedMainCredential: hasForwardableCodexBearer(callerAuthHeaders, config),
           beginCodexAccountSelection: codexAccountSelectionForTurn(options.turnAdmissionLease),
           resolveCodexModelEntitlements: entitlementResolver,
+          signal: AbortSignal.any([upstream.signal, AbortSignal.timeout(args.attempts.remainingMs())]),
         },
       );
+      const candidateHeaders = headersForCodexAuthContext(callerAuthHeaders, candidate,
+        options.codexAuthPolicy ?? config, route.modelId, options.admission);
+      if (args.attempts.visit(candidate, candidateHeaders)) retryAuthCtx = candidate;
+      else releaseCodexAuthContextProbeLease(candidate);
+    }
   } catch (error) {
     const unexpectedRetryError =
       !(error instanceof CodexPoolAuthenticationError)
@@ -1372,7 +1371,7 @@ async function retryCodexPoolOnAlternateAccount(
     // A body-confirmed quota response may arrive under HTTP 5xx. Without an alternate,
     // the ordinary terminal recorder sees only that wire status and would misclassify it
     // as transient, leaving the exhausted account immediately selectable next turn.
-    if (outcomeStatus !== firstResponse.status && (outcomeStatus === 429 || outcomeStatus === 402)) {
+    if (firstAuthCtx.kind !== "main" && outcomeStatus !== firstResponse.status && (outcomeStatus === 429 || outcomeStatus === 402)) {
       recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
         ...codexQuotaOutcomeMeta(firstResponse),
         threadId: firstAuthCtx.affinityKey,
@@ -1386,7 +1385,7 @@ async function retryCodexPoolOnAlternateAccount(
   }
 
   const quotaMeta = { ...codexQuotaOutcomeMeta(firstResponse), ...(await codexDenialOutcomeMeta(firstResponse)) };
-  if (outcomeStatus === 429 || outcomeStatus === 402) {
+  if (firstAuthCtx.kind !== "main" && (outcomeStatus === 429 || outcomeStatus === 402)) {
     const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/auth-api");
     applyAccountQuotaFromUpstreamHeaders(
       firstAuthCtx.accountId,
@@ -1401,6 +1400,7 @@ async function retryCodexPoolOnAlternateAccount(
     options.deferCodexResetDerivedCooldown,
   );
   const recordFirstOutcome = (): void => {
+    if (firstAuthCtx.kind === "main") return;
     recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
       ...quotaMeta,
       threadId: firstAuthCtx.affinityKey,
@@ -1408,6 +1408,7 @@ async function retryCodexPoolOnAlternateAccount(
       probeLeaseId: codexProbeLeaseId(firstAuthCtx),
       probeQuotaScope: codexProbeQuotaScope(firstAuthCtx),
       writerGeneration: firstAuthCtx.writerGeneration,
+      credentialGeneration: firstAuthCtx.kind === "pool" ? firstAuthCtx.generation : undefined,
       // Retry already advanced the RR ring via excludeAccountId — reuse for promotion.
       ...(retryAuthCtx.accountId ? { promoteAccountId: retryAuthCtx.accountId } : {}),
     });
@@ -1472,15 +1473,15 @@ async function retryCodexPoolOnAlternateAccount(
     while (true) {
       noteAttemptSend(logCtx.activeAttempt, passthroughEstimate);
       try {
-        upstreamResponse = await fetchWithHeaderTimeout(
+        upstreamResponse = await args.attempts.run(upstream.signal, recoverySignal => fetchWithHeaderTimeout(
           request.url,
           {
             method: request.method,
             headers: request.headers,
             body: request.body,
           },
-          upstream.signal,
-          connectMs,
+          recoverySignal,
+          Math.min(connectMs, args.attempts.remainingMs()),
           stream,
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             providerName: route.providerName,
@@ -1492,7 +1493,7 @@ async function retryCodexPoolOnAlternateAccount(
           // Credential-bearing forward send: never follow a redirect into a
           // dead-host rejection after the credential was seen (#914).
           route.provider.authMode === "forward",
-        );
+        ));
       } catch (error) {
         // Only the forward send is a transport boundary. Entitlement resolver throws below are
         // deliberately outside this catch so programming errors retain their original path.
@@ -2160,7 +2161,7 @@ async function resolveResponsesCodexAuth(
     }
     let authCtx: CodexAuthContext;
     if (route.codexAccountMode) {
-      authCtx = await resolveCodexAuthContext(authInputHeaders, config, route.codexAccountMode, {
+      authCtx = await resolveAvailableCodexAuthContext(authInputHeaders, config, route.codexAccountMode, {
         admission: options.admission,
         codexAuthPolicy: options.codexAuthPolicy,
         accountId: route.codexAccountId,
@@ -5144,7 +5145,10 @@ async function handleResponsesInner(
 
     const opaqueBlobRecoveryGuard: OpaqueBlobRecoveryGuard = { attempted: false };
     let oauth401ReplayAttempted = false;
-    let codex401ReplayKind: "main" | "stored" | null = null;
+    let codexRefreshFailureAccount: string | null | undefined;
+    const capturedCodexResponses = new WeakSet<Response>();
+    const codexAttempts = new CodexAccountAttempts();
+    codexAttempts.visit(authCtx, selectedForwardHeaders);
     const rateLimitPolicy = rateLimitRetryPolicyFor(route.provider);
     let rateLimitRetries = 0;
     const rebuildAndRefetch = async (
@@ -5226,10 +5230,9 @@ async function handleResponsesInner(
       upstreamResponse.status === 401
       && (authCtx.kind === "main-pool" || authCtx.kind === "pool")
       && usesCodexForwardPoolAuth(authCtx, route.provider)
-      && codex401ReplayKind === null
+      && codexAttempts.refreshOnce(authCtx)
     ) {
-      codex401ReplayKind = authCtx.kind === "pool" ? "stored" : "main";
-      try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed */ }
+      const codex401ReplayKind = authCtx.kind === "pool" ? "stored" : "main";
       const poolAuthCtx = authCtx.kind === "pool" ? authCtx : undefined;
       const poolReplay = poolAuthCtx
         ? await refreshPoolForwardAuth({ req, config, route, authCtx: poolAuthCtx, substituteMainCredential, options })
@@ -5249,83 +5252,83 @@ async function handleResponsesInner(
             credentialGeneration: poolReplay.quarantineGeneration ?? poolAuthCtx.generation,
           });
         }
-        upstream.abort();
-        releaseCodexAuthContextProbeLease(authCtx);
-        return replay.response;
-      }
-      authCtx = replay.authCtx;
-      route.provider = replay.provider;
-      selectedForwardHeaders = replay.headers;
-      const replayAdapter = resolveSelectionAdapter(
-        resolveWireProtocolOverride(route.providerName, route.modelId, replay.provider, inboundWire),
-        config.cacheRetention,
-      );
-      if (!("passthrough" in replayAdapter) || !replayAdapter.passthrough) {
-        upstream.abort();
-        return formatErrorResponse(502, "upstream_error", "Native main refresh changed the provider wire unexpectedly");
-      }
-      bindRouteReasoningReplayScope({
-        parsed,
-        providerName: route.providerName,
-        provider: replay.provider,
-        adapterName: replayAdapter.name,
-        codexAuthContext: authCtx,
-        forwardHeaders: selectedForwardHeaders,
-      });
-      logCtx.providerAdapter = replayAdapter.name;
-      sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, replayAdapter.name, logCtx.accountLogLabel);
-      recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, replayAdapter.name);
-      try {
-        request = await replayAdapter.buildRequest(parsed, {
-          headers: selectedForwardHeaders,
-          translatorBudget,
+        await upstreamResponse.body?.cancel().catch(() => undefined);
+        upstreamResponse = replay.response;
+        codexRefreshFailureAccount = authCtx.accountId;
+      } else {
+        await upstreamResponse.body?.cancel().catch(() => undefined);
+        authCtx = replay.authCtx;
+        route.provider = replay.provider;
+        selectedForwardHeaders = replay.headers;
+        const replayAdapter = resolveSelectionAdapter(
+          resolveWireProtocolOverride(route.providerName, route.modelId, replay.provider, inboundWire),
+          config.cacheRetention,
+        );
+        if (!("passthrough" in replayAdapter) || !replayAdapter.passthrough) {
+          upstream.abort();
+          return formatErrorResponse(502, "upstream_error", "Native main refresh changed the provider wire unexpectedly");
+        }
+        bindRouteReasoningReplayScope({
+          parsed,
+          providerName: route.providerName,
+          provider: replay.provider,
+          adapterName: replayAdapter.name,
+          codexAuthContext: authCtx,
+          forwardHeaders: selectedForwardHeaders,
         });
-        refreshRoutedNamespaceToolAliases(request);
-        recordAdapterReasoning(logCtx, request);
-        recordAdapterTier(logCtx, request);
-        refreshUndeclaredToolGuard(request);
-        // The 401 replay rebuilds the body before sending, so it needs the same ceiling as
-        // every other build site; a replay is exactly when a grown payload reappears.
-        const replayBodyRefusal = refuseOversizedOutboundBody(request);
-        if (replayBodyRefusal) return replayBodyRefusal;
-        noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, "oauth-401");
-        upstreamResponse = await fetchWithHeaderTimeout(
-          request.url,
-          { method: request.method, headers: request.headers, body: request.body },
-          upstream.signal,
-          connectMs,
-          parsed.stream,
-          // The replay-dispatched signal is what bounds the rest of this logical request, so it
-          // has to describe a send that actually happened. fetchWithHeaderTimeout awaits pacing
-          // admission BEFORE calling the executor, so signalling at the call site would spend the
-          // budget even when a rejected pacing wait means nothing reaches the network. Wrapping
-          // the executor moves the signal to the last moment before the send, where a throw from
-          // here on is a genuine transport attempt.
-          storedPoolReplayDispatchNotifier(
-            providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-              dispatchOverride: oauthDispatch(request),
-              providerName: route.providerName,
-              modelId: route.modelId,
-              onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
-              beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
-                ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
-            }),
-            codex401ReplayKind === "stored" ? options.onStoredPool401ReplayDispatched : undefined,
-          ),
-          route.provider.authMode === "forward",
-        ).then(response => {
-          settleObservedHostResponse();
-          return response;
-        });
-      } catch (err) {
-        return transportFailureResponse(err);
-      } finally {
-        request.releaseBodyObservation?.();
+        logCtx.providerAdapter = replayAdapter.name;
+        sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, replayAdapter.name, logCtx.accountLogLabel);
+        recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, replayAdapter.name);
+        try {
+          request = await replayAdapter.buildRequest(parsed, {
+            headers: selectedForwardHeaders,
+            translatorBudget,
+          });
+          refreshRoutedNamespaceToolAliases(request);
+          recordAdapterReasoning(logCtx, request);
+          recordAdapterTier(logCtx, request);
+          refreshUndeclaredToolGuard(request);
+          // The 401 replay rebuilds the body before sending, so it needs the same ceiling as
+          // every other build site; a replay is exactly when a grown payload reappears.
+          const replayBodyRefusal = refuseOversizedOutboundBody(request);
+          if (replayBodyRefusal) return replayBodyRefusal;
+          noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, "oauth-401");
+          upstreamResponse = await fetchWithHeaderTimeout(
+            request.url,
+            { method: request.method, headers: request.headers, body: request.body },
+            upstream.signal,
+            connectMs,
+            parsed.stream,
+            // The replay-dispatched signal is what bounds the rest of this logical request, so it
+            // has to describe a send that actually happened. fetchWithHeaderTimeout awaits pacing
+            // admission BEFORE calling the executor, so signalling at the call site would spend the
+            // budget even when a rejected pacing wait means nothing reaches the network. Wrapping
+            // the executor moves the signal to the last moment before the send, where a throw from
+            // here on is a genuine transport attempt.
+            storedPoolReplayDispatchNotifier(
+              providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+                dispatchOverride: oauthDispatch(request),
+                providerName: route.providerName,
+                modelId: route.modelId,
+                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
+                beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
+                  ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
+              }),
+              codex401ReplayKind === "stored" ? options.onStoredPool401ReplayDispatched : undefined,
+            ),
+            route.provider.authMode === "forward",
+          ).then(response => {
+            settleObservedHostResponse();
+            return response;
+          });
+        } catch (err) {
+          return transportFailureResponse(err);
+        } finally {
+          request.releaseBodyObservation?.();
+        }
+        continue passthroughRecovery;
       }
-      continue passthroughRecovery;
     }
-
-    if (codex401ReplayKind !== null && upstreamResponse.status === 401) break;
 
     // Native Responses providers return before the generic adapter recovery loop below. Keep
     // their OAuth contract identical: one pre-stream 401 forces a credential refresh and one
@@ -5551,7 +5554,8 @@ async function handleResponsesInner(
         || captureAuthCtx.kind === "pool"
         || captureAuthCtx.kind === "main-pool",
     ): void => {
-      if (!isCanonicalOpenAiForwardProvider(route.provider)) return;
+      if (!isCanonicalOpenAiForwardProvider(route.provider) || capturedCodexResponses.has(response)) return;
+      capturedCodexResponses.add(response);
       captureCodexAffinityDiagnostic({
         inboundHeaders: req.headers,
         outboundHeaders: captureRequest.headers,
@@ -5566,7 +5570,22 @@ async function handleResponsesInner(
     };
     captureAffinityResponse(upstreamResponse);
 
-    if (usesCodexForwardPoolAuth(authCtx, route.provider)) {
+    const canRetryCodexAccount = usesCodexForwardPoolAuth(authCtx, route.provider)
+      || (authCtx.kind === "main" && route.codexAccountMode === "pool"
+        && route.codexAccountId === undefined && !authCtx.reserveAuthorization
+        && isCanonicalOpenAiForwardProvider(route.provider));
+    if (canRetryCodexAccount) {
+      // Inspect only lifecycle events. Any output item or tool event closes recovery.
+      const preflightLog: RequestLogContext = { model: logCtx.model, provider: logCtx.provider };
+      const preflight = await preflightComboStreamResponse(upstreamResponse, preflightLog, payload => {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+        const type = (payload as { type?: unknown }).type;
+        const message = upstreamErrorMessageFromPayload(payload);
+        return (type === "error" || type === "response.failed" || type === "response.incomplete")
+          && message !== undefined && isRateLimitOrQuotaFailureMessage(message);
+      }, { allowMissingContentType: parsed.stream, replayReadErrors: true, maxWaitMs: 10_000, signal: upstream.signal });
+      if (upstream.signal.aborted) return transportFailureResponse(upstream.signal.reason);
+      upstreamResponse = preflight.response;
       let poolRetryOutcome: number | undefined;
       if (await shouldRetryCodexPoolAccountModel400(
         upstreamResponse,
@@ -5574,7 +5593,7 @@ async function handleResponsesInner(
         options.abortSignal,
       )) {
         poolRetryOutcome = 400;
-      } else if (!authCtx.fixedAccount && await shouldRetryCodexPoolAccountQuota(
+      } else if (!isFixedCodexAccount(authCtx) && await shouldRetryCodexPoolAccountQuota(
         upstreamResponse,
         options.abortSignal,
       )) {
@@ -5584,15 +5603,10 @@ async function handleResponsesInner(
         poolRetryOutcome = upstreamResponse.status >= 500 ? 429 : upstreamResponse.status;
       }
 
-      if (poolRetryOutcome !== undefined) {
-        // A stored Pool 401 spent this request's account budget on its own refresh and replay, so
-        // nothing afterwards may be paid for out of a DIFFERENT account. One flag carries that,
-        // rather than a status check here as well: a quota failure has no same-account move, so
-        // `sameAccountOnly` makes it terminal by refusing the alternate; the gated-model 400
-        // ladder does have one — retrying the account the refreshed roster still grants — and
-        // keeps it. An earlier revision also broke here on a non-400 outcome, which no test could
-        // justify because this flag already produced the identical result.
-        const storedReplaySpent = codex401ReplayKind === "stored";
+      if ((upstreamResponse.status === 401 || codexRefreshFailureAccount === authCtx.accountId)
+        && !isFixedCodexAccount(authCtx)
+        && !outboundResponsesBodyCarriesEncryptedFunctionOutput(request.body)) poolRetryOutcome = upstreamResponse.status;
+      if (poolRetryOutcome !== undefined && codexAttempts.remainingMs() > 0) {
         const retry = await retryCodexPoolOnAlternateAccount({
           callerAuthHeaders,
           config,
@@ -5603,7 +5617,7 @@ async function handleResponsesInner(
           firstAuthCtx: authCtx,
           firstResponse: upstreamResponse,
           outcomeStatus: poolRetryOutcome,
-          sameAccountOnly: storedReplaySpent,
+          attempts: codexAttempts,
           upstream,
           connectMs,
           passthroughEstimate,
@@ -5630,7 +5644,14 @@ async function handleResponsesInner(
           selectedForwardHeaders = retry.selectedForwardHeaders;
           // Keep subagent quota-failure health keyed to the account that actually served.
           subagentFallbackAccountId = retry.authCtx.accountId;
+          continue passthroughRecovery;
         }
+      }
+      if (preflight.kind === "failed") {
+        // All candidates were considered. Retain the original stream terminal so
+        // normal relay, quota health, and client callbacks keep the same contract.
+        await upstreamResponse.body?.cancel().catch(() => undefined);
+        upstreamResponse = preflight.originalResponse;
       }
     }
     // The deterministic route record cannot classify history it never observed (restart, expiry,

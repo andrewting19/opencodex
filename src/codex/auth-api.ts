@@ -70,6 +70,10 @@ export { clearAccountNeedsReauth, isAccountNeedsReauth, markAccountNeedsReauth }
 import { clearAccountNeedsReauth, isAccountNeedsReauth, markAccountNeedsReauth } from "./account-runtime-state";
 import {
   clearAccountQuota,
+  captureCodexQuotaObservation,
+  codexQuotaUsageObservedAt,
+  isCodexQuotaObservationCurrent,
+  type CodexQuotaObservation,
   getAccountQuota,
   isCompleteCodexQuotaRecoverySnapshot,
   isCodexQuotaExhausted,
@@ -945,6 +949,7 @@ async function fetchMainAccountInfoWhileOwned(
   let quotaRefreshGeneration = captureMainAccountIdentityGeneration();
   try {
     const dispatchSequence = ++quotaDispatchSequence;
+    const quotaObservation = captureCodexQuotaObservation();
     const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
       headers: { Authorization: `Bearer ${tokens.access_token}`, "ChatGPT-Account-Id": tokens.account_id },
       signal: quotaSignal,
@@ -982,7 +987,8 @@ async function fetchMainAccountInfoWhileOwned(
     }
     // Check after body/retry awaits and before any cache, credits, policy or
     // Reserve publication. Returning cached state supplies no fresh recovery proof.
-    if (dispatchSequence < mainQuotaPublishedSequence) {
+    if (dispatchSequence < mainQuotaPublishedSequence
+      || !isCodexQuotaObservationCurrent(MAIN_CODEX_ACCOUNT_ID, quotaObservation)) {
       return { info: getMainAccountInfoCache() ?? EMPTY_MAIN_ACCOUNT_INFO,
         credentialChecked: true, hasCredential: true };
     }
@@ -1023,9 +1029,9 @@ async function fetchMainAccountInfoWhileOwned(
     // Mirror main quota + plan into the shared stores so the rotation engine can
     // score and auto-switch the main account exactly like a pool account (Option A).
     setMainAccountPlan(result.plan);
-    if (result.quota) {
-      setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, usage);
-    }
+    const quotaCommitted = result.quota
+      ? setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, usage, quotaObservation)
+      : false;
     mainQuotaPublishedSequence = dispatchSequence;
     return {
       info: result,
@@ -1033,8 +1039,8 @@ async function fetchMainAccountInfoWhileOwned(
       quotaRefreshGeneration,
       credentialChecked: true,
       hasCredential: true,
-      ...(quota ? { freshQuota: quota } : {}),
-      ...(quota && mainQuotaWriter && isMainQuotaWriterLive(mainQuotaWriter)
+      ...(quota && quotaCommitted ? { freshQuota: quota } : {}),
+      ...(quota && quotaCommitted && mainQuotaWriter && isMainQuotaWriterLive(mainQuotaWriter)
         && mainQuotaCredentialGeneration === getMainQuotaCredentialGeneration()
         && matchesMainQuotaCredential(tokens.access_token, tokens.account_id)
         ? { resetRecoveryProof: { writer: mainQuotaWriter, credentialGeneration: mainQuotaCredentialGeneration, dispatchSequence } }
@@ -1087,10 +1093,12 @@ interface PoolQuotaProbeEvidence {
   onDispatch?: (sequence: number) => void;
   mayPublish?: () => boolean;
   attempted?: NonNullable<PoolQuotaResult["quotaProbeAttempted"]>;
+  observation?: CodexQuotaObservation;
 }
 
 function markQuotaProbeAttempted(evidence: PoolQuotaProbeEvidence, credentialGeneration: number): void {
   const dispatchSequence = ++quotaDispatchSequence;
+  evidence.observation = captureCodexQuotaObservation();
   evidence.attempted = { at: Date.now(), credentialGeneration, dispatchSequence };
   evidence.onDispatch?.(dispatchSequence);
 }
@@ -1345,6 +1353,7 @@ async function recoverPoolQuotaFrom401(ctx: {
   const result = await commitPoolQuotaResponse(replay, {
     accountId, existing, configuredPlan, generation: refreshed.generation, writerGeneration,
     mayPublish: ctx.quotaProbeEvidence.mayPublish,
+    observation: ctx.quotaProbeEvidence.observation,
   });
   return result.freshCredentialGeneration === refreshed.generation ? {
     ...result,
@@ -1386,6 +1395,7 @@ async function commitPoolQuotaResponse(
     generation: number;
     writerGeneration: number;
     mayPublish?: () => boolean;
+    observation?: CodexQuotaObservation;
   },
 ): Promise<PoolQuotaResult> {
   const { accountId, existing, configuredPlan, generation, writerGeneration } = ctx;
@@ -1407,7 +1417,9 @@ async function commitPoolQuotaResponse(
   if (!isCodexAccountGenerationLive(accountId, generation)) {
     return { quota: null, needsReauth: false, credentialGeneration: generation };
   }
-  setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, quota, data);
+  if (!setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, quota, data, ctx.observation)) {
+    return { quota: getAccountQuota(accountId), needsReauth: false, credentialGeneration: generation };
+  }
   return {
     quota: getAccountQuota(accountId),
     needsReauth: false,
@@ -1463,6 +1475,7 @@ async function fetchFreshPoolAccountQuota(
     const committed = await commitPoolQuotaResponse(resp, {
       accountId, existing, configuredPlan, generation, writerGeneration,
       mayPublish: quotaProbeEvidence.mayPublish,
+      observation: quotaProbeEvidence.observation,
     });
     return withQuotaProbeEvidence(committed, quotaProbeEvidence);
   } catch (e) {
@@ -1497,7 +1510,7 @@ export async function fetchPoolAccountQuota(
   afterDispatchSequence?: number,
 ): Promise<PoolQuotaResult> {
   const existing = getAccountQuota(accountId);
-  if (afterDispatchSequence === undefined && !forceRefresh && existing && Date.now() - existing.updatedAt < POOL_CACHE_TTL) {
+  if (afterDispatchSequence === undefined && !forceRefresh && existing && Date.now() - codexQuotaUsageObservedAt(existing) < POOL_CACHE_TTL) {
     return {
       quota: existing,
       needsReauth: false,
@@ -1823,7 +1836,7 @@ export async function primeCodexPoolQuotas(
     const pool = (runtimeConfig.codexAccounts ?? []).filter(isSelectableCodexPoolAccount);
     const stale = pool.filter(a => {
       const q = getAccountQuota(a.id);
-      if (q) return Date.now() - q.updatedAt >= POOL_CACHE_TTL;
+      if (q) return Date.now() - codexQuotaUsageObservedAt(q) >= POOL_CACHE_TTL;
       // No stored quota: either never primed, or the last attempt failed. Retry only
       // once per TTL window so an unreachable or rejecting account cannot turn every
       // prime trigger into another upstream request.
@@ -1847,7 +1860,7 @@ export async function primeCodexPoolQuotas(
             // exhausted across traffic. Re-read on the same TTL the pool rows
             // already honor.
             const existingMainQuota = getAccountQuota(MAIN_CODEX_ACCOUNT_ID);
-            if (existingMainQuota && Date.now() - existingMainQuota.updatedAt < POOL_CACHE_TTL) return;
+            if (existingMainQuota && Date.now() - codexQuotaUsageObservedAt(existingMainQuota) < POOL_CACHE_TTL) return;
             if (!(options.readMainTokens ?? readCodexTokens)()) return;
             if (options.fetchMainInfo) await options.fetchMainInfo(false);
             else await fetchMainAccountInfoAttempt(false, 1, mainLease, true);

@@ -235,7 +235,7 @@ describe("main policy quota writes", () => {
         expect(monthlyQuota).toEqual({ monthlyPercent: monthly, monthlyIsPrimaryWindow: true });
         setAccountQuotaFromParsed(MAIN, monthlyQuota, undefined, writer);
         expect(getMainPolicyQuota()).toEqual({
-          monthlyPercent: monthly, monthlyIsPrimaryWindow: true, updatedAt: expect.any(Number),
+          monthlyPercent: monthly, monthlyObservedAt: expect.any(Number), monthlyIsPrimaryWindow: true, updatedAt: expect.any(Number),
         });
         expect(getMainAccountHardLockStatus({ codexMainAccountHardLock: true }).state).toBe(state);
       });

@@ -485,7 +485,7 @@ describe("main account rotation (Option A)", () => {
 
   test("failure failover can move from a failing pool account onto the main account", () => {
     const config = makeConfig({ autoSwitchThreshold: 0, upstreamFailoverThreshold: 3 });
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("b", 50, 0);
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 5, 0);
     for (let i = 0; i < 3; i++) recordCodexUpstreamOutcome(config, "a", 500, { now });
@@ -494,7 +494,7 @@ describe("main account rotation (Option A)", () => {
 
   test("cooldown removes the main account from rotation candidates", () => {
     const config = makeConfig();
-    const now = 1_800_000_000_000;
+    const now = Date.now();
     updateAccountQuota("a", 90, 0);
     updateAccountQuota("b", 50, 0);
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 5, 0);
