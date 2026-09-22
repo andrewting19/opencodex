@@ -34,7 +34,7 @@ export const OPENAI_FAMILY_API_TYPES: ReadonlySet<string> = new Set(["chat_compl
 const CURSOR_EFFORT_FAMILIES: ReadonlyArray<{ test: RegExp; ladder: readonly string[] }> = [
   { test: /^gpt-5[.-]6-(?:luna|sol|terra)$/u, ladder: ["low", "medium", "high", "xhigh"] },
   { test: /^gpt-5(?:\.\d+)?$/u, ladder: ["low", "medium", "high", "xhigh"] },
-  { test: /^claude-opus-5$/u, ladder: ["low", "medium", "high", "xhigh", "max"] },
+  { test: /^claude-opus-5(?:-5)?$/u, ladder: ["low", "medium", "high", "xhigh", "max"] },
   { test: /^claude-opus-4[-.](?:7|8)$/u, ladder: ["low", "medium", "high", "xhigh", "max"] },
   { test: /^claude-sonnet-5$/u, ladder: ["low", "medium", "high", "xhigh", "max"] },
   { test: /^claude-opus-4[-.](?:5|6)$/u, ladder: ["low", "medium", "high", "max"] },

@@ -86,6 +86,11 @@ describe("Cursor installed-bundle effort table", () => {
       source: "static",
       family: null,
     });
+    expect(predictCursorEffort("anthropic/claude-opus-5-5", null)).toEqual({
+      ladder: ["low", "medium", "high", "xhigh", "max"],
+      source: "static",
+      family: null,
+    });
   });
 
   test("gemini withholds its ladder when the row will not advertise supports_reasoning", () => {
