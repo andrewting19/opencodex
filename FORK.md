@@ -56,6 +56,29 @@ Five fixes matter for multi-account operation and are not upstream:
    explicit Retry-After, credential generations, and probe leases remain enforced.
    Client turn checkpoints are required for recovery after output has started.
 
+## Current base
+
+The stack sits on upstream dev 60c5f57ce (package version 2.62.0), after v2.61.0.
+That base already carries upstream's Claude Opus 5.5 rows and the GPT-6 Sol
+and Luna catalog entries, so the fork no longer carries an Opus 5.5 patch.
+
+Port notes from the 2.50.0 -> 2.62.0 move:
+
+- Upstream split core.ts, auth-api.ts, and routing.ts. The anchors now live in
+  core-codex-account.ts, passthrough-dispatch.ts, auth-api/pool-quota-probe.ts,
+  auth-api/pool-mode-gate.ts, auth-api/main-account-probe.ts, and
+  routing/{cooldown-math,selection,probe-lease}.ts.
+- Upstream's request execution budget allows one account move per request. A
+  quota or credential refusal (429, 402, 401) is about one account, so patch 5
+  continues the walk when that budget refuses; the attempt list (each identity
+  once, 120 s) bounds it. Transient 5xx moves keep the strict budget. The 401
+  refresh replay gets one send even after the base allowance is spent.
+- The last-resort probe (allowQuotaProbe) may pass upstream's quota-avoidance
+  window only while the cooldown's probe lease is free.
+- Spark is no longer an independent quota scope upstream; the fork tests use
+  gpt-reserve instead.
+- Upstream tests that exercise the shared spend ledger need takeSpendHome().
+
 ## Rebase procedure after each upstream release
 
 1. git fetch upstream --tags
