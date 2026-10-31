@@ -26,3 +26,12 @@ export const WHAM_REQUEST_TIMEOUT_MS = 8_000;
  */
 export const QUOTA_RECOVERY_LEASE_MS =
   CODEX_REFRESH_FLIGHT_CEILING_MS + WHAM_REQUEST_TIMEOUT_MS * 2;
+
+/**
+ * Fork patch 2: how old a stored Codex quota row may get before a reader treats it as stale
+ * and a primer pass may re-fetch it.
+ *
+ * Declared in this leaf so the pool and main probes, the pre-route lazy prime, and the
+ * periodic staleness pass share one threshold and cannot drift apart.
+ */
+export const CODEX_POOL_QUOTA_STALE_MS = 5 * 60_000;

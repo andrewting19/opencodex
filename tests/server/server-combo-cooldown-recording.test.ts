@@ -174,7 +174,11 @@ test("a local Codex pool cooldown uses capped target backoff and permits account
     const recovered = await post(cfg);
     expect(recovered.status).toBe(200);
     expect(await recovered.text()).toContain("recovered");
-    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    // Fork patch 2: the row is now older than the shared TTL, so routing also starts a background
+    // WHAM read. Count inference sends only.
+    const inferenceSends = nativeFetch.mock.calls.filter(([input]) =>
+      !String(input instanceof Request ? input.url : input).includes("/wham/usage"));
+    expect(inferenceSends).toHaveLength(1);
   } finally {
     nativeFetch.mockRestore();
     clock.mockRestore();

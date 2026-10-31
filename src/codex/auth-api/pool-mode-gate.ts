@@ -258,7 +258,15 @@ export function registerCodexCooldownRecoveryProbeWorker(config: OcxConfig): voi
     afterTick: () => {
       void runCodexCooldownRecoveryProbes(config);
       void runMainAccountHardLockRecovery(config);
-      void primeCodexPoolQuotas(config, "credit-renewal");
+      // Fork patch 2: after credit renewal, re-read every row older than the shared TTL. The
+      // prime is single-flight, so a second call in the same tick would only join the renewal
+      // pass; chaining gives the staleness pass its own turn. Without it a stored 100% reading
+      // outlived an early window reset (a consumed reset credit, a plan change) and rotation
+      // kept a usable account cooled until some unrelated event re-read it.
+      void primeCodexPoolQuotas(config, "credit-renewal")
+        .catch(() => {})
+        .then(() => primeCodexPoolQuotas(config, "staleness"))
+        .catch(() => {});
     },
   });
 }
@@ -373,8 +381,9 @@ export async function primeCodexPoolQuotas(
             const quota = getAccountQuota(MAIN_CODEX_ACCOUNT_ID);
             const observationStale = reason === "priority-failback" && quota
               && !codexQuotaHasFreshUsage(quota, getMainAccountPlan(), Date.now(), CODEX_PRIORITY_FAILBACK_REFRESH_MS);
-            if (quota && (reason !== "priority-failback"
-              || (!observationStale && Date.now() - quota.updatedAt < MAIN_CACHE_TTL))) return;
+            // Fork patch 2: a stored main row no longer pins its reading forever; every reason
+            // re-reads it once it is older than the shared TTL.
+            if (quota && !observationStale && Date.now() - quota.updatedAt < MAIN_CACHE_TTL) return;
             if (!(options.readMainTokens ?? readCodexTokens)()
               && !(preparedToken && mainAccountTokenIsCurrent(preparedToken))) return;
             const bypassCachedQuota = !!observationStale;
