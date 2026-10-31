@@ -75,6 +75,8 @@ import { maskAccountId } from "../lib/privacy";
 import { formatErrorResponse, formatUsageLimitReachedResponse } from "../bridge";
 import { nextCodexPoolRecoveryAt } from "./routing/pool-recovery";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, getMainPolicyQuota, isValidWhamHistoryObservation, parseUsageQuota, parseMainPolicyUsageQuota, setAccountQuotaFromParsed } from "./quota";
+// Fork patch 2: the pre-route lazy prime treats a stale row like a missing one. Leaf import; no cycle.
+import { CODEX_POOL_QUOTA_STALE_MS } from "./quota-recovery-timing";
 import { codexAccountUsesCreditsAfterLimit, codexUsageLimitResetAt } from "./account-credit-use";
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig } from "../types";
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
@@ -1621,8 +1623,13 @@ async function resolveCodexAuthContextUnannotated(
   // repeated triggers into one pass. Opt-in priority failback also refreshes inactive
   // accounts; that path has a five-minute attempt limit inside the prime helper.
   const priorityFailback = codexAccountPriorityFailbackEnabled(config, accountId);
+  // Fork patch 2: a row older than the shared staleness threshold counts as unprimed, so
+  // traffic heals the same stale reading the periodic staleness pass heals.
+  const storedQuotaForPrime = getAccountQuota(accountId);
+  const quotaStaleForPrime = storedQuotaForPrime === null
+    || Date.now() - storedQuotaForPrime.updatedAt >= CODEX_POOL_QUOTA_STALE_MS;
   if (fixedAccountId === undefined && !nativeMainReadsForbidden
-    && (!getAccountQuota(accountId) || priorityFailback)) {
+    && (quotaStaleForPrime || priorityFailback)) {
     const reason = priorityFailback ? "priority-failback" : "pre-route";
     if (options.primeCodexPoolQuotas) {
       void options.primeCodexPoolQuotas(config, reason).catch(() => {});

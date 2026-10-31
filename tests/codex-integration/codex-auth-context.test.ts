@@ -279,6 +279,28 @@ describe("Codex auth context", () => {
     expect(reasons).toEqual(prime ? ["priority-failback"] : []);
   });
 
+  // Fork patch 2: a stored row older than the shared TTL counts as unprimed before routing.
+  test.each([
+    { ageMs: 60_000, primed: [] as string[] },
+    { ageMs: 360_000, primed: ["pre-route"] },
+  ])("pre-route primes a stale stored quota row ($ageMs ms old)", async ({ ageMs, primed }) => {
+    const cfg = config();
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pool_token", refreshToken: "pool_refresh",
+      expiresAt: Date.now() + 3_600_000, chatgptAccountId: "pool_acc",
+    });
+    const start = Date.now();
+    setAccountQuotaFromParsed("pool-a", { weeklyPercent: 10 });
+    const clock = spyOn(Date, "now").mockReturnValue(start + ageMs);
+    try {
+      const reasons: string[] = [];
+      await expect(resolveCodexAuthContext(new Headers(), cfg, "pool", {
+        primeCodexPoolQuotas: async (_config, reason) => { reasons.push(reason); },
+      })).resolves.toMatchObject({ kind: "pool", accountId: "pool-a" });
+      expect(reasons).toEqual(primed);
+    } finally { clock.mockRestore(); }
+  });
+
   test("main-profile drain routes a non-main pool account without native reads or quota priming", async () => {
     saveCodexAccountCredential("pool-a", {
       accessToken: "pool_token",

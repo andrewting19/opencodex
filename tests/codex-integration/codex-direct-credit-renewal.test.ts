@@ -186,6 +186,25 @@ describe("Direct explicit-account credit renewal", () => {
     expect(caller.get("authorization")).toBe("Bearer fixture-caller-main");
   });
 
+  // Fork patch 2: the sweep also re-reads Pool rows older than the shared TTL, after the
+  // renewal pass, even when no credit evidence is due. A fresh main row is left alone.
+  test("the registered sweep re-reads stale Pool usage rows that no renewal covers", async () => {
+    config.providers.openai!.codexAccountMode = "pool";
+    config.creditCodexAccountIds = [];
+    setAccountQuotaFromParsed("__main__", { weeklyPercent: 10, weeklyResetAt: now + 604_800_000 });
+    clock.mockReturnValue(now + 360_000);
+    setAccountQuotaFromParsed("__main__", { weeklyPercent: 10, weeklyResetAt: now + 604_800_000 });
+    reply = () => Response.json({ plan_type: "plus", rate_limit: {
+      primary_window: null,
+      secondary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: (now + 604_800_000) / 1000 },
+    } });
+    registeredTick()();
+    expect((await settleBackgroundWork({ timeoutMs: 1000 })).settled).toBe(true);
+    expect(calls.sort()).toEqual(["stored-a", "stored-b"]);
+    expect(getAccountQuota("stored-a")!.weeklyPercent).toBe(20);
+    expect(getAccountQuota("stored-a")!.updatedAt).toBe(now + 360_000);
+  });
+
   test("renewal joining a pending startup prime is retried by the next sweep", async () => {
     config.providers.openai!.codexAccountMode = "pool";
     clock.mockReturnValue(now + 360_000);

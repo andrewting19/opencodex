@@ -11,13 +11,13 @@ import { captureConfigGeneration } from "../../lib/state-store-sweeper";
 import { codexWarmupFailureReason, warmCodexAccount } from "../warmup";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
 import { ResourceAdmissionError } from "../../lib/admission";
-import { WHAM_REQUEST_TIMEOUT_MS } from "../quota-recovery-timing";
+import { CODEX_POOL_QUOTA_STALE_MS, WHAM_REQUEST_TIMEOUT_MS } from "../quota-recovery-timing";
 import { claimQuotaRecovery, fencePropagatedQuotaRecovery, quotaRecoveryTerminalFor, releaseQuotaRecovery, settleQuotaRecovery, settleQuotaRecoveryTerminal } from "../quota-401-recovery";
 import { seedLoginRowsForTests } from "./login-state";
 import { nonEmptyPlan } from "./runtime-config";
 import { CODEX_TERMINAL_AUTH_CODES } from "../quota-refresh-outcome";
 
-export const POOL_CACHE_TTL = 5 * 60_000;
+export const POOL_CACHE_TTL = CODEX_POOL_QUOTA_STALE_MS;
 export const POOL_QUOTA_REFRESH_CONCURRENCY = 4;
 
 export const MAIN_TERMINAL_AUTH_CODES: ReadonlySet<string> = new Set(CODEX_TERMINAL_AUTH_CODES);

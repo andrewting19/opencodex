@@ -25,7 +25,7 @@ import { observeMainReserveRevocation } from "../reserve-availability";
 import type { AdmissionLease } from "../../lib/admission";
 import { nonEmptyPlan } from "./runtime-config";
 import { tryAcquireNativeMainProfileClaim } from "../native-main-admission";
-import { WHAM_REQUEST_TIMEOUT_MS } from "../quota-recovery-timing";
+import { CODEX_POOL_QUOTA_STALE_MS, WHAM_REQUEST_TIMEOUT_MS } from "../quota-recovery-timing";
 import { withNativeMainCredentialClaim, isNativeMainObservationUnavailable } from "./http";
 import { readMainAuthErrorCode, currentQuotaDispatchSequence, nextQuotaDispatchSequence, isQuotaDispatchCurrent, publishQuotaDispatch } from "./pool-quota-probe";
 
@@ -62,7 +62,7 @@ export function mainResetCreditsForCurrentIdentity(): number | undefined {
   return mainResetCreditsProvenance.credits;
 }
 
-export const MAIN_CACHE_TTL = 5 * 60_000;
+export const MAIN_CACHE_TTL = CODEX_POOL_QUOTA_STALE_MS;
 
 function sharedMainQuotaPacingEnabled(config: OcxConfig): boolean {
   const openai = config.providers[OPENAI_CODEX_PROVIDER_ID];
