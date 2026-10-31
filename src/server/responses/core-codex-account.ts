@@ -504,6 +504,8 @@ export interface CodexPoolAccountRetryArgs {
   firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" }>;
   firstResponse: Response;
   outcomeStatus: number;
+  /** Fork patch 5: a later quota move in a multi-account walk; may pass a spent move budget. */
+  quotaWalk?: boolean;
   /**
    * Forbid resolving a DIFFERENT account for this retry.
    *
@@ -757,11 +759,13 @@ export async function retryCodexPoolOnAlternateAccount(
       sendClass: "account-failover",
       targetKey: `${route.providerName}|${route.modelId}|alternate-account`,
     });
-    if (!decision.allowed) {
+    if (decision.allowed) accountMovePermit = decision.permit;
+    // Fork patch 5: a quota refusal belongs to one account, so a later move in the same walk may
+    // pass a spent move budget. The walk itself bounds it: each account once, two minutes.
+    else if (!(args.quotaWalk === true && (outcomeStatus === 429 || outcomeStatus === 402))) {
       recordUnmovedTransientOutcome();
       return { kind: "no-alternate" };
     }
-    accountMovePermit = decision.permit;
   }
   try {
     retryAuthCtx ??= await resolveCodexAuthContext(

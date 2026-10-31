@@ -1618,7 +1618,14 @@ export async function preparePassthroughExchange(
     };
     recordDistributedResponseFailure(lastDistributedResponse ?? upstreamResponse, config, route.providerName, options.abortSignal);
     captureAffinityResponse(upstreamResponse);
-    if (usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)) {
+    // Fork patch 5: a quota refusal walks every distinct eligible account, one move at a time,
+    // instead of stopping after the single alternate upstream allows. Each refused account is
+    // cooled before the next selection, the walk visits an account at most once, and it ends
+    // after two minutes. Transient 5xx and gated-model 400 keep upstream's one-move bound.
+    const quotaWalkTried = new Set<string>();
+    const quotaWalkDeadline = Date.now() + 120_000;
+    let quotaWalkContinuing = false;
+    poolQuotaWalk: while (usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)) {
       let poolRetryOutcome: number | undefined;
       // A success is the freshest evidence there is about this pair, and it outranks any earlier
       // refusal: whatever the entitlement was when upstream declined, it is not that now. Both
@@ -1676,7 +1683,9 @@ export async function preparePassthroughExchange(
         // ladder does have one — retrying the account the refreshed roster still grants — and
         // keeps it. An earlier revision also broke here on a non-400 outcome, which no test could
         // justify because this flag already produced the identical result.
-        const storedReplaySpent = codex401ReplayKind === "stored" && !wasAccountAutoPaused(upstreamResponse);
+        const storedReplaySpent = !quotaWalkContinuing
+          && codex401ReplayKind === "stored" && !wasAccountAutoPaused(upstreamResponse);
+        const failedAccountId = admissionState.authCtx.accountId;
         const retry = await retryCodexPoolOnAlternateAccount({
           callerAuthHeaders,
           config,
@@ -1688,6 +1697,7 @@ export async function preparePassthroughExchange(
           firstResponse: upstreamResponse,
           outcomeStatus: poolRetryOutcome,
           sameAccountOnly: storedReplaySpent,
+          quotaWalk: quotaWalkContinuing,
           upstream,
           connectMs,
           passthroughEstimate,
@@ -1717,8 +1727,19 @@ export async function preparePassthroughExchange(
           requestState.selectedForwardHeaders = retry.selectedForwardHeaders;
           // Keep subagent quota-failure health keyed to the account that actually served.
           requestState.subagentFallbackAccountId = retry.authCtx.accountId;
+          if (failedAccountId) quotaWalkTried.add(failedAccountId);
+          if ((poolRetryOutcome === 429 || poolRetryOutcome === 402)
+            && !retry.upstreamResponse.ok
+            && !("fixedAccount" in admissionState.authCtx && admissionState.authCtx.fixedAccount)
+            && !options.abortSignal?.aborted
+            && Date.now() < quotaWalkDeadline
+            && !(retry.authCtx.accountId && quotaWalkTried.has(retry.authCtx.accountId))) {
+            quotaWalkContinuing = true;
+            continue poolQuotaWalk;
+          }
         }
       }
+      break;
     }
     // #6969: a projection nothing above recovered goes on as the original stream, before any reader.
     upstreamResponse = preOutputRefusals.restore(upstreamResponse);
