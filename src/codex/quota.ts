@@ -316,6 +316,8 @@ export function setAccountQuotaFromParsed(
   decisionObservationPartial = true,
   // Advisory publication is explicit opt-in evidence: display or policy data never becomes it by default.
   decisionRaw: Omit<StoredAccountQuota, "updatedAt"> | null = null,
+  /** Fork patch 4: only a complete WHAM window roster may remove windows absent from this observation. */
+  usageSnapshot?: WhamUsageResponse,
 ): void {
   quota = withoutRetiredCodexQuota(quota);
   policyQuota = withoutRetiredCodexQuota(policyQuota);
@@ -324,11 +326,17 @@ export function setAccountQuotaFromParsed(
   const isMain = accountId === MAIN_CODEX_ACCOUNT_ID;
   if (isMain && mainWriter && !isMainQuotaWriterLive(mainWriter)) return;
   hydrateAccountQuotasFromDisk();
-  const legacyExisting = accountQuota.get(accountId);
   const updatedAt = Date.now();
   const livePoolEvidence = historyEvidence
     ? historyEvidence.writer.accountId === accountId && isPoolQuotaWriterLive(historyEvidence.writer)
     : !poolRequest;
+  // Fork patch 4: retiring windows releases routing blocks, so it needs the same proof as short
+  // retirement below (a live main writer, or a live captured pool writer) and a fully valid roster.
+  const replacesWindows = usageSnapshot !== undefined
+    && hasCompleteUsageWindowSnapshot(usageSnapshot)
+    && isValidWhamHistoryObservation(usageSnapshot)
+    && (isMain ? mainWriter !== undefined : historyEvidence !== undefined && livePoolEvidence);
+  const legacyExisting = quotaMergeBase(accountQuota.get(accountId), replacesWindows);
   if (historyEvidence && livePoolEvidence) {
     publishCodexDecisionQuota(accountId, historyEvidence.writer.credentialGeneration, historyEvidence.raw, historyEvidence.observedAt, "codex", historyEvidence.source === "response-header");
     quotaHistory.append(historyEvidence.writer, { observedAt: historyEvidence.observedAt, source: historyEvidence.source,
@@ -363,7 +371,7 @@ export function setAccountQuotaFromParsed(
       observeMainAccountUsage(mainWriter.identityKey, windows, updatedAt);
     }
     const policyExisting = mainWriter && mainPolicyQuota?.identityKey === mainWriter.identityKey
-      ? mainPolicyQuota.quota
+      ? quotaMergeBase(mainPolicyQuota.quota, replacesWindows && policyQuota !== null)
       : undefined;
     mainPolicyQuota = mainWriter && (policyQuota || policyExisting)
       ? {
@@ -380,6 +388,52 @@ export function setAccountQuotaFromParsed(
     if (!isMain && policyQuota && livePoolEvidence) observeCodexLowQuota(accountId, policyQuota);
     notifyCodexQuotaSnapshot(accountId, next);
   }
+}
+
+/**
+ * Fork patch 4: whether a WHAM response states the account's complete standard window roster.
+ * Headers, incomplete WHAM payloads, and credits-only reads are partial updates.
+ */
+function hasCompleteUsageWindowSnapshot(data: WhamUsageResponse | undefined): boolean {
+  const limits = data?.rate_limit;
+  if (!limits || !Object.hasOwn(limits, "primary_window") || !Object.hasOwn(limits, "secondary_window")) return false;
+  // Same release rules as upstream short-window retirement: an explicit denial or any present
+  // reading that does not parse makes the roster untrustworthy.
+  if (limits.allowed === false) return false;
+  const readings = [limits.primary_window, limits.secondary_window, limits.tertiary_window];
+  for (const limit of Array.isArray(data?.additional_rate_limits) ? data.additional_rate_limits : []) {
+    if (limit && typeof limit === "object") readings.push(limit.rate_limit?.primary_window, limit.rate_limit?.secondary_window);
+  }
+  if (readings.some(window => window?.used_percent != null && normalizeUsagePercent(window.used_percent) === undefined)) return false;
+  const validWindow = (window: WhamUsageWindow | null | undefined): boolean => window === null || (
+    !!window
+    && typeof window.used_percent === "number" && Number.isFinite(window.used_percent)
+    && window.used_percent >= 0 && window.used_percent <= 100
+    && typeof window.limit_window_seconds === "number" && Number.isFinite(window.limit_window_seconds)
+    && window.limit_window_seconds > 0
+  );
+  return !!(limits.primary_window || limits.secondary_window)
+    && validWindow(limits.primary_window)
+    && validWindow(limits.secondary_window)
+    && (!Object.hasOwn(limits, "tertiary_window") || validWindow(limits.tertiary_window));
+}
+
+const STANDARD_QUOTA_WINDOW_FIELDS = [
+  "weeklyPercent", "weeklyResetAt", "monthlyPercent", "monthlyResetAt", "monthlyIsPrimaryWindow",
+  "shortPercent", "shortResetAt", "shortObservedAt", "shortWindowSeconds",
+] as const;
+
+/**
+ * Fork patch 4: after a complete refresh, merge onto the stored row without its standard windows.
+ * The old merge carried a 100% monthly window forward after OpenAI moved an account to a weekly
+ * window, so a usable account kept reading as exhausted. Credits, reset credits, and custom
+ * windows are separate observations and stay.
+ */
+function quotaMergeBase(existing: StoredAccountQuota | undefined, replacesWindows: boolean): StoredAccountQuota | undefined {
+  if (!existing || !replacesWindows) return existing;
+  const base: StoredAccountQuota = { ...existing };
+  for (const field of STANDARD_QUOTA_WINDOW_FIELDS) delete base[field];
+  return base;
 }
 
 /**

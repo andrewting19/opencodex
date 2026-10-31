@@ -438,7 +438,7 @@ export async function fetchMainAccountInfoWhileOwned(
       // score and auto-switch the main account exactly like a pool account (Option A).
       setMainAccountPlan(result.plan);
       if (result.quota) {
-        setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, undefined, false, false, isValidWhamHistoryObservation(usage) ? quota : null);
+        setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, result.quota, writerGeneration, mainQuotaWriter, policyQuota, undefined, false, false, isValidWhamHistoryObservation(usage) ? quota : null, usage ?? undefined);
       }
       publishQuotaDispatch(dispatchSequence);
       readState.usable = quota !== null;
