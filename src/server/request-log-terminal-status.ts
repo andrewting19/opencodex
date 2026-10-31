@@ -21,6 +21,9 @@ export interface UpstreamErrorDiagnostics {
 interface TerminalStatusContext extends UpstreamErrorDiagnostics {
   terminalHttpStatus?: number;
   terminalErrorCode?: typeof CYBER_POLICY_ERROR_CODE;
+  /** Quota hints embedded in a stand-in `error` frame's `headers` (fork patch 1). */
+  terminalQuotaRetryAfter?: string;
+  terminalQuotaResetAt?: string[];
 }
 
 export interface UpstreamErrorPayload {
@@ -30,6 +33,8 @@ export interface UpstreamErrorPayload {
   /** Codex WebSocket wrapper status (`status_code` is its alias); read only on bare `error` events. */
   status?: unknown;
   status_code?: unknown;
+  /** Would-be HTTP response headers the Codex WebSocket wrapper embeds in an `error` frame. */
+  headers?: unknown;
   error?: { type?: unknown; code?: unknown; message?: unknown };
   last_error?: { type?: unknown; code?: unknown; message?: unknown };
   response?: {
@@ -151,6 +156,46 @@ export function wrappedServerErrorStatus(json: UpstreamErrorPayload): number | u
   return status !== undefined && status >= 500 ? status : undefined;
 }
 
+/**
+ * Fork patch 1: the HTTP rejection an in-stream `error` frame stands in for, or undefined.
+ *
+ * Over HTTP SSE an exhausted account answers with a real 429 before the stream starts. Over the
+ * Codex WebSocket transport the backend can accept the turn and then deliver the same rejection
+ * as an `error` frame that carries `status_code` and the would-be response headers. Upstream only
+ * projects such frames before the response is committed (#3740), keeps a wrapper 5xx (#6740), and
+ * leaves a wrapper 4xx unrecorded. A late quota frame then ended on the EOF path as an incomplete
+ * success for account health, so an exhausted account never entered cooldown and was selected
+ * again on every turn. Recording the quota status here is enough: the EOF recorder already treats
+ * an incomplete turn with a 429/402 terminal status as quota. Credential 4xx frames stay with
+ * upstream's own handling.
+ */
+export function httpStatusFromErrorEvent(parsed: unknown): number | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const status = codexWsWrapperStatus(parsed as Record<string, unknown>);
+  return status === 429 || status === 402 ? status : undefined;
+}
+
+const TERMINAL_QUOTA_RESET_HEADERS = [
+  "x-codex-primary-reset-at",
+  "x-codex-secondary-reset-at",
+  "x-codex-tertiary-reset-at",
+];
+
+/** Lift Retry-After / x-codex-*-reset-at out of an `error` frame's embedded headers. */
+function captureTerminalQuotaHints(logCtx: TerminalStatusContext, headers: unknown): void {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return;
+  const byName = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (typeof value === "string" && value.trim()) byName.set(name.toLowerCase(), value.trim());
+  }
+  const retryAfter = byName.get("retry-after");
+  if (retryAfter !== undefined) logCtx.terminalQuotaRetryAfter = retryAfter;
+  const resetAt = TERMINAL_QUOTA_RESET_HEADERS
+    .map(name => byName.get(name))
+    .filter((value): value is string => value !== undefined);
+  if (resetAt.length > 0) logCtx.terminalQuotaResetAt = resetAt;
+}
+
 function captureTerminalHttpStatus(
   logCtx: TerminalStatusContext,
   json: UpstreamErrorPayload,
@@ -220,6 +265,14 @@ function captureTerminalHttpStatus(
       code: candidates.find(candidate => typeof candidate?.code === "string")?.code,
       type: candidates.slice(0, -1).find(candidate => typeof candidate?.type === "string")?.type,
     });
+    // Fork patch 1: a frame that states a quota rejection on its wrapper is that HTTP rejection,
+    // whatever its structured class, and keeps its window hints for the cooldown.
+    const errorEventStatus = httpStatusFromErrorEvent(json);
+    if (errorEventStatus !== undefined) {
+      noteStatus(errorEventStatus);
+      captureTerminalQuotaHints(logCtx, json.headers);
+      return;
+    }
     if (structured) {
       noteStatus(structured.httpStatus);
       return;

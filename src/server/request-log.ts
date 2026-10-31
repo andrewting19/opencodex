@@ -245,6 +245,13 @@ export interface RequestLogContext extends UpstreamErrorDiagnostics {
   upstreamError?: string;
   /** HTTP status derived from a terminal `response.failed` SSE payload (429/401/503/etc.). */
   terminalHttpStatus?: number;
+  /**
+   * Fork patch 1: quota-window hints carried by a terminal `error` frame that stands in for an
+   * HTTP rejection (the Codex WebSocket transport delivers a late 429 this way, with the response
+   * headers embedded). Account cooldown consumes them exactly like the HTTP headers.
+   */
+  terminalQuotaRetryAfter?: string;
+  terminalQuotaResetAt?: string[];
   /** Recognized structured terminal code whose exact identity must survive status mapping. */
   terminalErrorCode?: typeof CYBER_POLICY_ERROR_CODE;
   /**

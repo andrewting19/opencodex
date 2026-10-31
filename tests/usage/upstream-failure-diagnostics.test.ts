@@ -168,7 +168,8 @@ test.each([
 });
 
 test.each([
-  ["a client status", { status: 429 }],
+  // Fork patch 1 records a wrapper 429/402 as quota (tests/codex-error-event-http-status.test.ts).
+  ["a client status", { status: 401 }],
   ["a not-found status", { status_code: 404 }],
   ["a numeric string", { status: "503" }],
   ["a fractional number", { status: 503.5 }],
