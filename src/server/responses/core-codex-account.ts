@@ -1197,7 +1197,17 @@ export function codexForwardTerminalOutcomeRecorder(
     const outcome = status === "completed"
       ? 200
       : (quotaStatus ?? httpStatusOverride ?? logCtx?.terminalHttpStatus ?? 502);
+    // Fork patch 1: a quota rejection delivered in-stream carries its Retry-After / reset headers
+    // inside the frame. Hand them to the cooldown as the HTTP-header path does, so the account
+    // sleeps until its window resets instead of for the 60 s default.
+    const quotaHints = outcome === 429 || outcome === 402
+      ? {
+        ...(logCtx?.terminalQuotaRetryAfter !== undefined ? { retryAfter: logCtx.terminalQuotaRetryAfter } : {}),
+        ...(logCtx?.terminalQuotaResetAt !== undefined ? { resetAt: logCtx.terminalQuotaResetAt } : {}),
+      }
+      : {};
     recordCodexUpstreamOutcome(config, authCtx.accountId, outcome, {
+      ...quotaHints,
       ...windowMeta,
       threadId: authCtx.affinityKey,
       fixedAccount: authCtx.fixedAccount,
