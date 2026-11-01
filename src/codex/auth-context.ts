@@ -1029,6 +1029,8 @@ export interface ResolveCodexAuthContextOptions {
   /** Live policy owner when the routing config is a caller-specific replay snapshot. */
   codexAuthPolicy?: CodexAuthPolicyConfig;
   excludeAccountId?: string;
+  /** Fork patch 5: last-resort pick in a quota walk; see CodexAccountUsabilityOptions. */
+  allowQuotaProbe?: boolean;
   /** Resolve exactly this account without consulting or mutating Pool selection. */
   accountId?: string;
   /** Final native model selected for this request, used to select its quota group. */
@@ -1425,6 +1427,7 @@ async function resolveCodexAuthContextUnannotated(
       modelEligibleAccountIds,
       deniedModelAccountIds,
       requestOwnedMainCredential: requestScopedMainCredential,
+      allowQuotaProbe: options.allowQuotaProbe === true,
       // Request-scoped and deliberately absent from `sharedStateSelectionOptions`: one
       // conversation's attachments say nothing about where unrelated threads should be served.
       retainAccountForUploadedFiles: options.retainAccountForUploadedFiles === true,

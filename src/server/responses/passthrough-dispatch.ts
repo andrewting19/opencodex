@@ -101,18 +101,12 @@ import {
   upstreamHostCircuitOpenResponse,
   usesCodexForwardPoolAuth,
   codexWsQuotaObserver,
-  codexPoolAccountModel400Denial,
-  shouldRetryCodexPoolAccountQuota,
-  shouldRetryCodexPoolAccountTransient,
   retryCodexPoolOnAlternateAccount,
   PoolPreOutputRefusals,
   poolPreOutputRefusalHold,
 } from "./core-codex-account";
-import {
-  clearCodexModelDenialEvidence,
-  recordCodexModelDenialEvidence,
-} from "../../codex/model-entitlements";
 import { codexWsSocketDeathStage, isCodexWsUpstreamResponse } from "./codex-ws-wire";
+import { callerMainMayWalk, classifyPoolWalkOutcome, PoolQuotaWalk, preflightPoolQuotaStream, releasePoolQuotaStreamHold } from "./pool-quota-walk";
 import { linkAbortSignal } from "./core-lifetime";
 import type { CodexAuthContext } from "../../codex/auth-context";
 import { checkOutboundBodySize, describeOutboundBodyRefusal } from "./outbound-body-guard";
@@ -1184,6 +1178,8 @@ export async function preparePassthroughExchange(
     };
 
     // Keep recovery kinds in sync with the generic `recovery:` loop below.
+    // Fork patch 5: outside the loop, because a walk step that needs a token refresh goes back through it.
+    const quotaWalk = new PoolQuotaWalk();
     passthroughRecovery: for (;;) {
       if (wasAccountAutoPaused(upstreamResponse) && route.provider.authMode !== "forward") {
         const recovered = await recoverAutoPausedAccount({ requestKey: transportState, reserve: reserveCredentialHop,
@@ -1199,9 +1195,10 @@ export async function preparePassthroughExchange(
       upstreamResponse.status === 401 && !wasPermanentAccountRefusal(upstreamResponse)
       && (admissionState.authCtx.kind === "main-pool" || admissionState.authCtx.kind === "pool")
       && usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)
-      && codex401ReplayKind === null
+      && (codex401ReplayKind === null || quotaWalk.continuing) && quotaWalk.mayRefresh(admissionState.authCtx)
     ) {
       codex401ReplayKind = admissionState.authCtx.kind === "pool" ? "stored" : "main";
+      quotaWalk.markRefreshed(admissionState.authCtx);
       try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed */ }
       const poolAuthCtx = admissionState.authCtx.kind === "pool" ? admissionState.authCtx : undefined;
       const poolReplay = poolAuthCtx
@@ -1312,7 +1309,7 @@ export async function preparePassthroughExchange(
             ).then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-            attempts: remainingTransientSendBudget(transientSendAttempts()),
+            attempts: remainingTransientSendBudget(transientSendAttempts()) || quotaWalk.replayFloor(),
             onSendsConsumed: transientSendReporter(), claimAmbiguousResend: claimPreHeaderResend },
         );
       } catch (err) {
@@ -1607,58 +1604,13 @@ export async function preparePassthroughExchange(
     // instead of stopping after the single alternate upstream allows. Each refused account is
     // cooled before the next selection, the walk visits an account at most once, and it ends
     // after two minutes. Transient 5xx and gated-model 400 keep upstream's one-move bound.
-    const quotaWalkTried = new Set<string>();
-    const quotaWalkDeadline = Date.now() + 120_000;
-    let quotaWalkContinuing = false;
-    poolQuotaWalk: while (usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)) {
-      let poolRetryOutcome: number | undefined;
-      // A success is the freshest evidence there is about this pair, and it outranks any earlier
-      // refusal: whatever the entitlement was when upstream declined, it is not that now. Both
-      // ids are cleared because the wire model can differ from the routed one.
-      if (upstreamResponse.ok) {
-        clearCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
-          route.modelId,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
-        );
-        clearCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
-          parsed.modelId,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
-        );
-      }
-      const model400Denial = await codexPoolAccountModel400Denial(
-        upstreamResponse,
-        route.modelId,
-        options.abortSignal,
-        parsed.modelId,
-      );
-      if (wasAccountAutoPaused(upstreamResponse)) {
-        poolRetryOutcome = upstreamResponse.status;
-      } else if (model400Denial !== undefined) {
-        // Spend this refusal on more than one retry. It is the account's own authenticated
-        // answer about this model, and the roster cache that selection otherwise reads expires
-        // five minutes after a catalog sync fills it -- so without remembering this, the next
-        // request selects the same account on quota alone and takes the same 400 (#4906).
-        recordCodexModelDenialEvidence(
-          admissionState.authCtx.accountId,
-          model400Denial,
-          admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
-        );
-        poolRetryOutcome = 400;
-      } else if (!admissionState.authCtx.fixedAccount && await shouldRetryCodexPoolAccountQuota(
-        upstreamResponse,
-        options.abortSignal,
-      )) {
-        // Pre-stream only: once SSE has begun, mid-stream quota stays terminal.
-        // ChatGPT sometimes wraps quota exhaustion in a generic 5xx. Normalize only
-        // body-confirmed cases to quota evidence so cooldown and rotation both apply.
-        poolRetryOutcome = upstreamResponse.status >= 500 ? 429 : upstreamResponse.status;
-      } else if (!admissionState.authCtx.fixedAccount && shouldRetryCodexPoolAccountTransient(upstreamResponse)) {
-        // A plain transient 5xx the same-account retry layer could not absorb. Keep the real
-        // status so it records as transient rather than quota.
-        poolRetryOutcome = upstreamResponse.status;
-      }
+    poolQuotaWalk: while (usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)
+      || callerMainMayWalk(admissionState.authCtx, route)) {
+      const walkAuthCtx = admissionState.authCtx;
+      if (walkAuthCtx.kind !== "pool" && walkAuthCtx.kind !== "main-pool" && walkAuthCtx.kind !== "main") break;
+      upstreamResponse = await preflightPoolQuotaStream(upstreamResponse, walkAuthCtx, logCtx, upstreamRequestsStream, upstream.signal);
+      if (upstream.signal.aborted) return transportFailureResponse(upstream.signal.reason);
+      const poolRetryOutcome = await classifyPoolWalkOutcome(upstreamResponse, walkAuthCtx, route.modelId, parsed.modelId, options.abortSignal);
 
       if (poolRetryOutcome !== undefined) {
         // A stored Pool 401 spent this request's account budget on its own refresh and replay, so
@@ -1668,9 +1620,12 @@ export async function preparePassthroughExchange(
         // ladder does have one — retrying the account the refreshed roster still grants — and
         // keeps it. An earlier revision also broke here on a non-400 outcome, which no test could
         // justify because this flag already produced the identical result.
-        const storedReplaySpent = !quotaWalkContinuing
+        const quotaRefusal = poolRetryOutcome === 429 || poolRetryOutcome === 402;
+        // Fork patch 5: a quota refusal after a refresh is about this account's quota; it may walk.
+        const storedReplaySpent = !quotaWalk.continuing && !quotaRefusal
           && codex401ReplayKind === "stored" && !wasAccountAutoPaused(upstreamResponse);
         const failedAccountId = admissionState.authCtx.accountId;
+        const walkFirstResponse = upstreamResponse;
         const retry = await retryCodexPoolOnAlternateAccount({
           callerAuthHeaders,
           config,
@@ -1682,7 +1637,8 @@ export async function preparePassthroughExchange(
           firstResponse: upstreamResponse,
           outcomeStatus: poolRetryOutcome,
           sameAccountOnly: storedReplaySpent,
-          quotaWalk: quotaWalkContinuing,
+          quotaWalk: quotaWalk.continuing || (quotaRefusal && codex401ReplayKind !== null),
+          callerAlreadyTried: quotaWalk.callerTried(),
           upstream,
           connectMs,
           passthroughEstimate,
@@ -1704,6 +1660,7 @@ export async function preparePassthroughExchange(
           return transportFailureResponse(retry.error);
         }
         if (retry.kind === "retried") {
+          releasePoolQuotaStreamHold(walkFirstResponse);
           admissionState.authCtx = retry.authCtx;
           request = retry.request;
           refreshRequestToolAliases(request);
@@ -1712,14 +1669,12 @@ export async function preparePassthroughExchange(
           requestState.selectedForwardHeaders = retry.selectedForwardHeaders;
           // Keep subagent quota-failure health keyed to the account that actually served.
           requestState.subagentFallbackAccountId = retry.authCtx.accountId;
-          if (failedAccountId) quotaWalkTried.add(failedAccountId);
-          if ((poolRetryOutcome === 429 || poolRetryOutcome === 402)
-            && !retry.upstreamResponse.ok
-            && !("fixedAccount" in admissionState.authCtx && admissionState.authCtx.fixedAccount)
-            && !options.abortSignal?.aborted
-            && Date.now() < quotaWalkDeadline
-            && !(retry.authCtx.accountId && quotaWalkTried.has(retry.authCtx.accountId))) {
-            quotaWalkContinuing = true;
+          quotaWalk.markTried(failedAccountId);
+          if (quotaWalk.mayContinue(quotaRefusal, retry.authCtx, options.abortSignal?.aborted === true)) {
+            quotaWalk.continuing = true;
+            // The next account's own expired token refreshes once through the recovery loop; any
+            // other answer, including an OK stream, goes back through the walk's preflight.
+            if (quotaWalk.nextNeedsRefresh(retry.upstreamResponse, retry.authCtx)) continue passthroughRecovery;
             continue poolQuotaWalk;
           }
         }

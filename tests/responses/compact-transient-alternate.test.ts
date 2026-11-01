@@ -187,11 +187,14 @@ describe("native compact moves a surviving transient 5xx to one alternate accoun
     expect(sends.every(auth => auth === "Bearer work-access")).toBe(true);
   });
 
-  test("a 5xx whose body confirms quota keeps today's path and does not take the transient move", async () => {
+  // Fork patch 5: a 5xx whose body confirms quota is a quota refusal, so it takes the quota walk
+  // (recorded as 429), never the transient move.
+  test("a 5xx whose body confirms quota moves through the quota walk", async () => {
     const quota: Answer = () => Response.json({ error: { message: "You have hit your usage limit." } }, { status: 503 });
     upstream(quota, quota, quota, compacted);
-    await compact();
-    expect(sends).not.toContain("Bearer other-access");
+    const { response } = await compact();
+    expect(response.status).toBe(200);
+    expect(sends.at(-1)).toBe("Bearer other-access");
   });
 
   test("B refused before sending by a spent budget leaves A's answer and outcome intact", async () => {

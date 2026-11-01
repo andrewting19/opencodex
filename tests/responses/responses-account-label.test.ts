@@ -503,10 +503,7 @@ describe("request-owned Codex account recovery", () => {
   });
 
   for (const committed of [false, true]) {
-    // Fork patch 5 on 2.95: the skipped tests in this file cover parts of the 2.62 patch that are
-    // not ported yet (SSE pre-output recovery, identity dedup, caller-main walk, per-account
-    // refresh, reset-derived probe, compaction walk). See FORK.md.
-    test.skip(`${committed ? "keeps" : "recovers"} a quota SSE failure ${committed ? "after" : "before"} output`, async () => {
+    test(`${committed ? "keeps" : "recovers"} a quota SSE failure ${committed ? "after" : "before"} output`, async () => {
       await withPoolHome(async () => {
         takeSpendHome();
         const ids = ["stream-a", "stream-b", "stream-c"];
@@ -526,17 +523,22 @@ describe("request-owned Codex account recovery", () => {
         const response = await handleResponses(request(), config, { model: "", provider: "" });
         await response.text();
         expect(sends).toEqual((committed ? ids.slice(0, 1) : ids).map(id => `${id}_chatgpt`));
-        expect(response.status).toBe(200);
+        // After output the failure stays terminal and is not moved. 2.95 reports a failed terminal
+        // to this buffered (non-stream) client as 502, the same as plain v2.95.0.
+        expect(response.status).toBe(committed ? 502 : 200);
       });
     });
   }
 
-  test.skip("does not send twice to duplicate stored subscriptions", async () => {
+  test("does not send twice to duplicate stored subscriptions", async () => {
     await withPoolHome(async () => {
       takeSpendHome();
       const ids = ["duplicate-a", "duplicate-b", "healthy-c"];
       const config = poolConfig(ids);
       config.accountPoolStrategy = "fill-first";
+      // A real duplicate login carries the same email; distinct emails on one workspace id are
+      // distinct members (upstream collision rule).
+      config.codexAccounts!.find(row => row.id === "duplicate-b")!.email = "duplicate-a@example.test";
       ids.forEach(id => { savePoolCredential(id); updateAccountQuota(id, 0); });
       saveCodexAccountCredential("duplicate-b", {
         accessToken: "duplicate-rotated-token", refreshToken: "duplicate-refresh", expiresAt: Date.now() + 300_000,
@@ -556,7 +558,7 @@ describe("request-owned Codex account recovery", () => {
   });
 });
 
-test.skip("a request-owned main credential can fail over through the full Pool", async () => {
+test("a request-owned main credential can fail over through the full Pool", async () => {
   await withPoolHome(async () => {
     takeSpendHome();
     const config = poolConfig(["caller-a", "caller-b"]);
@@ -581,7 +583,7 @@ test.skip("a request-owned main credential can fail over through the full Pool",
   });
 });
 
-test.skip("each account can refresh its own token before recovery reaches the third account", async () => {
+test("each account can refresh its own token before recovery reaches the third account", async () => {
   await withPoolHome(async () => {
     takeSpendHome();
     const ids = ["refresh-a", "refresh-b", "refresh-c"];
@@ -592,7 +594,8 @@ test.skip("each account can refresh its own token before recovery reaches the th
     const refreshes: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).includes("/oauth/token")) {
-        const grant = new URLSearchParams(String(init?.body)).get("refresh_token")!;
+        const raw = String(init?.body);
+        const grant = (raw.trim().startsWith("{") ? JSON.parse(raw).refresh_token : new URLSearchParams(raw).get("refresh_token")) as string;
         refreshes.push(grant);
         const id = grant.replace(/-refresh-token$/, "");
         return Response.json({ access_token: `${id}-renewed`, refresh_token: grant, expires_in: 3600 });
@@ -609,7 +612,7 @@ test.skip("each account can refresh its own token before recovery reaches the th
   });
 });
 
-test.skip("recovery can probe an untried account with a due reset-derived cooldown", async () => {
+test("recovery can probe an untried account with a due reset-derived cooldown", async () => {
   await withPoolHome(async () => {
     takeSpendHome();
     const ids = ["probe-a", "probe-b", "probe-c"];
@@ -633,7 +636,7 @@ test.skip("recovery can probe an untried account with a due reset-derived cooldo
 });
 
 for (const status of [429, 502]) {
-  test.skip(`native compaction reaches the third account after ${status} quota failures`, async () => {
+  test(`native compaction reaches the third account after ${status} quota failures`, async () => {
     await withPoolHome(async () => {
       takeSpendHome();
       const ids = ["compact-a", "compact-b", "compact-c"];

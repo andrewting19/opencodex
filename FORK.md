@@ -6,7 +6,7 @@ The main branch mirrors upstream so upgrade diffs stay one command away.
 
 ## Why this fork exists
 
-Five fixes matter for multi-account operation. Fix 3 is now upstream:
+Six fixes matter for multi-account operation. Fix 3 is now upstream:
 
 1. In-stream error frames are HTTP rejections (relay.ts, request-log.ts,
    responses/core.ts, tests/codex-error-event-http-status.test.ts).
@@ -56,10 +56,20 @@ Five fixes matter for multi-account operation. Fix 3 is now upstream:
    explicit Retry-After, credential generations, and probe leases remain enforced.
    Client turn checkpoints are required for recovery after output has started.
 
+6. Reset-first drains the soonest weekly reset (`routing/selection.ts`). Unspent
+   weekly capacity is lost at its reset, so the account whose long window resets
+   first is used until it reaches the switch threshold, then the next one. The
+   five-hour reset only breaks ties; a full five-hour window still skips the account.
+
 ## Current base
 
-The stack sits on upstream tag v2.95.0 (package version 2.95.0). The 2.62.0
-stack is kept on branch fork/main-2.62.
+The stack sits on upstream tag v2.96.0 (package version 2.96.0). Older stacks
+are kept on branches fork/main-2.95 and fork/main-2.62.
+
+2.96.0 rebase note: upstream added a { failure } result to
+resolveAlternateCompactContext (installation-id errors) and the
+applyCompactPoolQuotaHeaders helper in compact.ts. The compaction walk uses
+both with quotaFailCtx and refusalStatus.
 
 Status of each fix on this base:
 
@@ -74,20 +84,45 @@ Status of each fix on this base:
 - Fix 4: ported. setAccountQuotaFromParsed takes a usageSnapshot argument; a
   complete, valid, allowed roster with a live writer proof drops the standard
   window fields before the merge.
-- Fix 5: partly ported. The Responses passthrough path walks every distinct
-  eligible Pool account on 429/402 (each account once, 120 s limit). A later
-  quota move may pass a spent account-move budget (quotaWalk in
-  core-codex-account.ts). Transient 5xx and gated 400 keep the one-move bound.
-  Not ported yet (tests skipped in tests/responses/responses-account-label.test.ts):
-  identity dedup of duplicate stored subscriptions (fork account-attempts.ts),
-  caller-main walk through the full Pool, per-account token refresh inside the
-  walk, the reset-derived allowQuotaProbe, HTTP SSE quota recovery before
-  output, and the native compaction walk (compact.ts was rewritten upstream
-  with a shared send budget and gateway transport).
+- Fix 5: ported. The 2.62 attempt-list module (account-attempts.ts) is not
+  carried; 2.95 cools each refused account before the next selection, so the
+  port builds on that:
+  - Responses passthrough walks every eligible account on a quota refusal:
+    each account once, 120 s limit. The walk state, the outcome classification
+    and the stream preflight live in src/server/responses/pool-quota-walk.ts,
+    which keeps passthrough-dispatch.ts under the 2000-line module limit. A
+    later quota move may pass a spent account-move budget (quotaWalk).
+    Transient 5xx and gated 400 keep upstream's one-move bound. A quota
+    refusal after a stored 401 refresh may also walk (upstream tests updated).
+  - A request-owned caller main credential in Pool mode starts the walk on a
+    quota refusal, and is not offered again in the same walk.
+  - Each account may refresh its token once inside the walk; the refresh
+    replay keeps one send.
+  - When every account is cooled, the walk may use the one bounded probe a
+    due cooldown allows (allowQuotaProbe in selection.ts / auth-context.ts).
+  - A quota refusal also cools stored entries that are the same subscription
+    (storedCodexSubscriptionDuplicates in collision-identity.ts). Upstream
+    already excludes a stored duplicate of main.
+  - An HTTP event stream that fails with quota before any output is inspected
+    by the combo preflight and walks like a 429. The failed preflight is a held
+    projection (2.95's WebSocket hold); with no move, the original stream is
+    restored byte for byte and its outcome is recorded once. WebSocket
+    upstreams are skipped; 2.95 has its own WebSocket pre-output recovery.
+  - Native compaction (compact.ts) walks the same way, and a 5xx whose body
+    confirms quota now takes the quota walk, also after a stored 401 refresh
+    (upstream tests updated).
+  - Not ported: the 2.62 per-window observation times (weeklyObservedAt and
+    similar) and the rule that a reading older than 5 minutes does not count
+    in the usage score. Fix 2 re-reads stale rows every 5 minutes instead.
+- Fix 6: reset-first drains the account whose weekly (or 30-day) window
+  resets first; the five-hour reset only breaks ties (selection.ts).
+  Recommended settings: strategy reset-first, autoSwitchThreshold 99, equal
+  priorities.
 
-Known failures on plain v2.95.0 (not from the fork): 3 tests in
-tests/server/server-auth.test.ts and 12 WebSocket tests in
-tests/responses/codex-ws-handshake.test.ts and ws-native-result-continuations.test.ts.
+Known failures on plain upstream (not from the fork): compare each test folder
+against a clean worktree of the upstream tag (git worktree add ../base vX.Y.Z)
+and diff the (fail) lines. On this Mac, bun 1.3.6 segfaults in tests/server on
+both trees.
 
 ## Rebase procedure after each upstream release
 
