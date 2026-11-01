@@ -16,7 +16,7 @@ import {
   selectPriorityTier,
 } from "../pool-rotation";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota, resetAtToMs } from "../quota";
-import { codexPlanKey } from "../plan";
+import { codexPlanKey, isThirtyDayOnlyCodexPlan } from "../plan";
 import { MAIN_CODEX_ACCOUNT_ID, getMainAccountPlan } from "../main-account";
 import type { OcxConfig } from "../../types";
 import { CODEX_FAILURE_WINDOW_MS, computeCodexUsageScore } from "./cooldown-math";
@@ -353,7 +353,13 @@ export function hasCodexSharedStateQuotaHeadroom(
   return isUnknownUsage(usage) || usage < 100;
 }
 
-/** Earliest future shared short/weekly reset; missing evidence and ties use usage order. */
+/**
+ * Fork patch 6: drain the account whose long window (weekly, or monthly on a 30-day plan) resets
+ * first. Unspent long-window capacity is lost at its reset, so the account closest to that reset
+ * is used until it reaches the switch threshold, and only then the next one. The five-hour window
+ * only breaks ties: a full short window already removes the account through headroom. Accounts
+ * with no future long reset go last. Ties and missing evidence use usage order.
+ */
 export function pickResetFirstCodexAccount(
   config: OcxConfig,
   ids: readonly string[],
@@ -362,19 +368,24 @@ export function pickResetFirstCodexAccount(
 ): string | null {
   const available = ids.filter(id => hasCodexQuotaHeadroom(config, id, selectionOptions, now));
   if (available.length === 0) return pickLowestUsageAmong(config, ids, selectionOptions, now);
-  let earliest = Number.POSITIVE_INFINITY;
+  const futureReset = (value: unknown): number => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return Number.POSITIVE_INFINITY;
+    const ms = resetAtToMs(value);
+    return ms > now ? ms : Number.POSITIVE_INFINITY;
+  };
+  let earliest: [number, number] = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
   let candidates: string[] = [];
   for (const id of available) {
     const quota = getAccountQuota(id);
-    const resets = [quota?.shortResetAt, quota?.weeklyResetAt]
-      .filter((reset): reset is number => typeof reset === "number" && Number.isFinite(reset))
-      .map(resetAtToMs)
-      .filter(reset => reset > now);
-    const next = Math.min(...resets);
-    if (next < earliest) {
+    const monthlyOnly = isThirtyDayOnlyCodexPlan(getPoolAccountPlanForSelection(config, id, selectionOptions));
+    const long = monthlyOnly
+      ? futureReset(quota?.monthlyResetAt)
+      : Math.min(futureReset(quota?.weeklyResetAt), futureReset(quota?.monthlyResetAt));
+    const next: [number, number] = [long, futureReset(quota?.shortResetAt)];
+    if (next[0] < earliest[0] || (next[0] === earliest[0] && next[1] < earliest[1])) {
       earliest = next;
       candidates = [id];
-    } else if (next === earliest) candidates.push(id);
+    } else if (next[0] === earliest[0] && next[1] === earliest[1]) candidates.push(id);
   }
   return pickLowestUsageAmong(config, candidates, selectionOptions, now);
 }
