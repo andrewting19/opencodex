@@ -369,7 +369,7 @@ describe("accountPoolStrategy new-session routing", () => {
     expect(parseCodexAccountPoolStrategy("invalid")).toBeNull();
   });
 
-  test("reset-first compares both windows, previews without writes, and uses the same failover order", () => {
+  test("reset-first ranks by the weekly reset, previews without writes, and uses the same failover order", () => {
     const config = makeThreeAccountConfig({ accountPoolStrategy: "reset-first" });
     const now = Date.now();
     const seconds = now / 1000;
@@ -381,7 +381,8 @@ describe("accountPoolStrategy new-session routing", () => {
     expect(getEffectiveActiveCodexAccountId(config)).toBe("a");
     expect(resolveCodexAccountForThread("reset-task", config, now)).toBe("b");
     expect(config.activeCodexAccountId).toBe("a");
-    expect(pickAlternateCodexAccount(config, "b", now)).toBe("c");
+    // Fork patch 6: c's earlier five-hour reset does not outrank a's earlier weekly reset.
+    expect(pickAlternateCodexAccount(config, "b", now)).toBe("a");
   });
 
   test("reset-first compares seconds and milliseconds in the same clock", () => {
@@ -502,16 +503,31 @@ describe("accountPoolStrategy new-session routing", () => {
     expect(resolveCodexAccountForThread("account-override-reset", config, now + 1, scope)).toBe("b");
   });
 
-  test("reset-first ignores past/missing resets and breaks ties by usage", () => {
+  test("reset-first ignores past/missing resets and drains a known weekly reset first", () => {
     const config = makeThreeAccountConfig({ accountPoolStrategy: "reset-first" });
     const now = Date.now();
     setAccountQuotaFromParsed("a", { weeklyPercent: 10, weeklyResetAt: now / 1000 - 1 });
     setAccountQuotaFromParsed("b", { weeklyPercent: 30, weeklyResetAt: now / 1000 + 20 });
     setAccountQuotaFromParsed("c", { weeklyPercent: 20, shortPercent: 10, shortResetAt: now / 1000 + 20 });
-    expect(resolveCodexAccountForThread(null, config, now)).toBe("c");
+    // Fork patch 6: only b has a future weekly reset, so b drains before c.
+    expect(resolveCodexAccountForThread(null, config, now)).toBe("b");
     expect(resolveCodexAccountForThread(null, config, now + 20_000)).toBe("a");
     clearAccountQuota();
     expect(resolveCodexAccountForThread(null, config, now)).toBe("a");
+  });
+
+  test("reset-first drains the soonest weekly reset and skips it only while its five-hour window is full", () => {
+    const config = makeThreeAccountConfig({ accountPoolStrategy: "reset-first" });
+    const now = Date.now();
+    const s = now / 1000;
+    const day = 86_400;
+    setAccountQuotaFromParsed("a", { weeklyPercent: 5, weeklyResetAt: s + 6 * day, shortPercent: 0, shortResetAt: s + 60 });
+    setAccountQuotaFromParsed("b", { weeklyPercent: 70, weeklyResetAt: s + 1 * day, shortPercent: 40, shortResetAt: s + 4 * 3600 });
+    setAccountQuotaFromParsed("c", { weeklyPercent: 30, weeklyResetAt: s + 3 * day, shortPercent: 0, shortResetAt: s + 30 });
+    expect(resolveCodexAccountForThread(null, config, now)).toBe("b");
+    setAccountQuotaFromParsed("b", { weeklyPercent: 75, weeklyResetAt: s + 1 * day, shortPercent: 100, shortResetAt: s + 3600 });
+    expect(resolveCodexAccountForThread(null, config, now)).toBe("c");
+    expect(resolveCodexAccountForThread(null, config, now + 3601_000)).toBe("b");
   });
 
   test("reset-first preserves priority and availability and honors disabled thresholds", () => {
