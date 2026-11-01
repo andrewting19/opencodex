@@ -856,7 +856,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     expect(isAccountNeedsReauth(ACCOUNT_ID)).toBe(false);
   });
 
-  test("Responses does not compose a stored-account replay 429 with another Pool account", async () => {
+  // Fork patch 5: a quota refusal after the refresh walks to the next account.
+  test("Responses tries another account after a stored-account replay 429", async () => {
     writeStoredAccount({
       [OTHER_ACCOUNT_ID]: storedRecord({
         accessToken: "other-access",
@@ -874,7 +875,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           return Response.json({ error: { message: "pool exhausted" } }, { status: 429 });
         }
         if (authorization === "Bearer other-access") {
-          return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+          return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
         }
         return undefined;
       },
@@ -890,8 +891,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       { model: "", provider: "" } as RequestLogContext,
     );
 
-    expect(response.status).toBe(429);
-    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(response.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access", "Bearer other-access"]);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 
@@ -999,7 +1000,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
   });
 
   for (const replayStatus of [429, 402] as const) {
-    test(`compact does not compose a stored-account replay ${replayStatus} with another account or remembered model`, async () => {
+    // Fork patch 5: compaction walks after a stored refresh too; the remembered model stays unused.
+    test(`compact tries another account after a stored-account replay ${replayStatus}`, async () => {
       const headers = { "x-codex-parent-thread-id": `compact-refresh-budget-${replayStatus}` };
       writeStoredAccount({
         [OTHER_ACCOUNT_ID]: storedRecord({
@@ -1042,7 +1044,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           }
           if (authorization === "Bearer other-access") {
             alternateAccountSends += 1;
-            return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+            return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
           }
           return undefined;
         },
@@ -1061,13 +1063,14 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
         { model: "", provider: "" } as RequestLogContext,
       );
 
-      expect(response.status).toBe(replayStatus);
+      expect(response.status).toBe(200);
       expect(harness.sends).toEqual([
         "Bearer seed-test-key",
         "Bearer rejected-access",
         "Bearer refreshed-access",
+        "Bearer other-access",
       ]);
-      expect(alternateAccountSends).toBe(0);
+      expect(alternateAccountSends).toBe(1);
       expect(seedModelSends).toBe(1);
       expect(harness.refreshes).toEqual(["refresh-grant"]);
     });
@@ -1278,10 +1281,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 
-  test("a stored-account replay 402 cannot reach another account even when one is eligible", async () => {
-    // The mirror of the case above: a quota failure has no same-account move left, so it is
-    // terminal. Asserted with a healthy alternate present, so passing means the budget stopped
-    // it rather than there being nowhere to go.
+  test("a stored-account replay 402 walks to another eligible account", async () => {
+    // Fork patch 5: the quota refusal is about the refreshed account only, so the walk moves on.
     writeStoredAccount({
       [OTHER_ACCOUNT_ID]: storedRecord({
         accessToken: "other-access",
@@ -1299,7 +1300,7 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
           return Response.json({ error: { message: "quota exhausted" } }, { status: 402 });
         }
         if (authorization === "Bearer other-access") {
-          return Response.json({ id: "must-not-run", object: "response", status: "completed", output: [] });
+          return Response.json({ id: "alternate-served", object: "response", status: "completed", output: [] });
         }
         return undefined;
       },
@@ -1313,8 +1314,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
       { model: "", provider: "" } as RequestLogContext,
     );
 
-    expect(response.status).toBe(402);
-    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(response.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access", "Bearer other-access"]);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
   });
 

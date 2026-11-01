@@ -8,6 +8,7 @@ import {
   formatCodexProviderForLog,
 } from "../../codex/routing";
 import { claimMainQuotaDispatchForWs, isMainQuotaDispatchLive, renewMainQuotaDispatchForAttempt, type MainQuotaDispatch } from "../../codex/main-account-cache";
+import { storedCodexSubscriptionDuplicates } from "../../codex/collision-identity";
 import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { isCodexAccountGenerationLive } from "../../codex/account-store";
@@ -501,11 +502,17 @@ export interface CodexPoolAccountRetryArgs {
     /** Root workflow this turn belongs to, so the move is charged there as well. */
     workflowRootId?: string;
   };
-  firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" }>;
+  /**
+   * Fork patch 5: also a request-owned `main` credential in Pool mode. It has no Pool id to cool
+   * or promote, so its refusal records nothing here and the next selection excludes main.
+   */
+  firstAuthCtx: Extract<CodexAuthContext, { kind: "pool" | "main-pool" | "main" }>;
   firstResponse: Response;
   outcomeStatus: number;
   /** Fork patch 5: a later quota move in a multi-account walk; may pass a spent move budget. */
   quotaWalk?: boolean;
+  /** Fork patch 5: this walk already sent with the caller's own credential. */
+  callerAlreadyTried?: boolean;
   /**
    * Forbid resolving a DIFFERENT account for this retry.
    *
@@ -678,6 +685,7 @@ export async function retryCodexPoolOnAlternateAccount(
     // must not record the same refusal again, and a recorded projection tells delivery to skip it.
     if (codexWsPreOutputRefusalOutcomeRecorded(firstResponse)) return;
     noteCodexWsPreOutputRefusalOutcome(firstResponse);
+    if (firstAuthCtx.kind === "main") return;
     recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
       ...codexFailureWindowOutcomeMeta(firstAuthCtx),
       threadId: firstAuthCtx.affinityKey,
@@ -695,6 +703,9 @@ export async function retryCodexPoolOnAlternateAccount(
   // leaving the exhausted account immediately selectable next turn.
   const recordWrappedQuotaOutcome = (): void => {
     if (outcomeStatus === firstResponse.status || (outcomeStatus !== 429 && outcomeStatus !== 402)) return;
+    if (firstAuthCtx.kind === "main") return;
+    // A held projection records here once; its restored stream must not record again.
+    noteCodexWsPreOutputRefusalOutcome(firstResponse);
     recordCodexUpstreamOutcome(config, firstAuthCtx.accountId, outcomeStatus, {
       ...codexQuotaOutcomeMeta(firstResponse),
       ...codexFailureWindowOutcomeMeta(firstAuthCtx),
@@ -706,7 +717,7 @@ export async function retryCodexPoolOnAlternateAccount(
       writerGeneration: firstAuthCtx.writerGeneration,
     });
   };
-  if (outcomeStatus === 400 && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId)) {
+  if (outcomeStatus === 400 && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId) && firstAuthCtx.kind !== "main") {
     invalidateCodexModelEntitlementsForAccount(firstAuthCtx.accountId);
     let refreshed;
     try {
@@ -729,7 +740,7 @@ export async function retryCodexPoolOnAlternateAccount(
   }
   // Exact account selectors may retry the same confirmed account above, but must never resolve
   // an alternate. Quota failures and a refreshed entitlement miss remain terminal.
-  if (!retryAuthCtx && (firstAuthCtx.fixedAccount || args.sameAccountOnly === true)) {
+  if (!retryAuthCtx && ((firstAuthCtx.kind !== "main" && firstAuthCtx.fixedAccount) || args.sameAccountOnly === true)) {
     recordUnmovedTransientOutcome();
     return { kind: "no-alternate" };
   }
@@ -768,23 +779,45 @@ export async function retryCodexPoolOnAlternateAccount(
     }
   }
   try {
-    retryAuthCtx ??= await resolveCodexAuthContext(
+    const quotaOutcome = outcomeStatus === 429 || outcomeStatus === 402;
+    // Fork patch 5: a stored duplicate of the refusing subscription shares its quota. Cool it
+    // with the same evidence before selection, so this walk does not send to it a second time.
+    if (!retryAuthCtx && quotaOutcome && firstAuthCtx.kind === "pool") {
+      const duplicateMeta = codexQuotaOutcomeMeta(firstResponse);
+      for (const duplicateId of storedCodexSubscriptionDuplicates(config, firstAuthCtx.accountId)) {
+        recordCodexUpstreamOutcome(config, duplicateId, outcomeStatus, { ...duplicateMeta, modelId: route.modelId });
+      }
+    }
+    const resolveRetry = (allowQuotaProbe: boolean) => resolveCodexAuthContext(
         callerAuthHeaders,
         config,
         "pool",
         {
-          excludeAccountId: firstAuthCtx.accountId,
+          excludeAccountId: firstAuthCtx.accountId ?? MAIN_CODEX_ACCOUNT_ID,
+          ...(allowQuotaProbe ? { allowQuotaProbe: true } : {}),
           signal: options.abortSignal,
           admission: options.admission,
           codexAuthPolicy: options.codexAuthPolicy,
           modelId: route.modelId,
-          requestScopedMainCredential: codexRouteCredentialOwnership(callerAuthHeaders, config, {
+          // Fork patch 5: a refused caller credential cannot be this retry's answer.
+          requestScopedMainCredential: firstAuthCtx.kind !== "main" && args.callerAlreadyTried !== true
+            && codexRouteCredentialOwnership(callerAuthHeaders, config, {
             provider: route.provider, codexAccountMode: "pool",
           }, options).requestScopedMainCredential,
           beginCodexAccountSelection: codexAccountSelectionForTurn(options.turnAdmissionLease),
           resolveCodexModelEntitlements: entitlementResolver,
         },
       );
+    if (!retryAuthCtx) {
+      try {
+        retryAuthCtx = await resolveRetry(false);
+      } catch (error) {
+        // Fork patch 5: when every account is cooled, a quota walk may send the one bounded probe a
+        // due cooldown allows before it returns the refusal.
+        if (!(quotaOutcome && error instanceof CodexPoolAuthenticationError)) throw error;
+        retryAuthCtx = await resolveRetry(true);
+      }
+    }
   } catch (error) {
     const unexpectedRetryError =
       !(error instanceof CodexPoolAuthenticationError)
@@ -818,7 +851,7 @@ export async function retryCodexPoolOnAlternateAccount(
     (outcomeStatus === 429 || outcomeStatus === 402)
     && !await shouldRetryCodexScopedQuotaOnAlternate(
       firstResponse,
-      firstAuthCtx.chatgptAccountId,
+      firstAuthCtx.kind === "main" ? callerCodexWorkspaceAccountId(callerAuthHeaders) ?? "" : firstAuthCtx.chatgptAccountId,
       retryAuthCtx.kind === "pool" || retryAuthCtx.kind === "main-pool"
         ? retryAuthCtx.chatgptAccountId
         // A request-owned `main` alternate has no stored account id; its workspace
@@ -847,7 +880,7 @@ export async function retryCodexPoolOnAlternateAccount(
   }
 
   const quotaMeta = { ...codexQuotaOutcomeMeta(firstResponse), ...(await codexDenialOutcomeMeta(firstResponse)) };
-  if (outcomeStatus === 429 || outcomeStatus === 402) {
+  if ((outcomeStatus === 429 || outcomeStatus === 402) && firstAuthCtx.kind !== "main") {
     const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/auth-api");
     applyAccountQuotaFromUpstreamHeaders(
       firstAuthCtx.accountId,
@@ -863,7 +896,7 @@ export async function retryCodexPoolOnAlternateAccount(
     options.deferCodexResetDerivedCooldown,
   );
   const recordFirstOutcome = (): void => {
-    if (wasPermanentAccountRefusal(firstResponse)) {
+    if (wasPermanentAccountRefusal(firstResponse) || firstAuthCtx.kind === "main") {
       noteCodexWsPreOutputRefusalOutcome(firstResponse);
       return;
     }

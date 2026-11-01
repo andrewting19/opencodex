@@ -40,6 +40,11 @@ export interface CodexAccountUsabilityOptions {
    */
   retainAccountForUploadedFiles?: boolean;
   /**
+   * Fork patch 5: a last-resort pick inside one request's quota walk may consider a cooled account
+   * while that cooldown's single bounded probe lease is free. Read only by Pool eligibility.
+   */
+  allowQuotaProbe?: boolean;
+  /**
    * Main is live for this request only because the request carries its own main bearer (#5019).
    *
    * Main may then win this request's selection, but that credential belongs to the request, not

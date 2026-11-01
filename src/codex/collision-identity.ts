@@ -101,3 +101,29 @@ export function configuredCodexMainDuplicate(config: Pick<OcxConfig, "codexAccou
   const account = config.codexAccounts?.find(row => row.id === accountId);
   return !!account && isStoredCodexMainDuplicate(account);
 }
+
+function storedCollisionIdentity(account: CodexAccount): CodexCollisionIdentity | undefined {
+  const credential = getCodexAccountCredential(account.id);
+  if (!credential?.chatgptAccountId) return undefined;
+  const storedEmail = normalizedEmail(account.email);
+  const email = storedEmail && storedEmail !== normalizedEmail(account.id)
+    ? storedEmail : extractEmail(undefined, credential.accessToken);
+  return { accountId: credential.chatgptAccountId, email,
+    plan: codexPlanKey(account.plan) ? account.plan : extractChatgptPlanType(undefined, credential.accessToken) };
+}
+
+/**
+ * Fork patch 5: other stored Pool entries that are the same subscription as this stored account.
+ * They share one quota, so a quota refusal on one is evidence about all of them.
+ */
+export function storedCodexSubscriptionDuplicates(config: Pick<OcxConfig, "codexAccounts">, accountId: string): string[] {
+  const accounts = config.codexAccounts ?? [];
+  const source = accounts.find(row => row.id === accountId);
+  const identity = source && !source.isMain ? storedCollisionIdentity(source) : undefined;
+  if (!identity) return [];
+  return accounts.flatMap(row => {
+    if (row.id === accountId || row.isMain) return [];
+    const other = storedCollisionIdentity(row);
+    return other && sameCodexCollisionIdentity(identity, other) ? [row.id] : [];
+  });
+}

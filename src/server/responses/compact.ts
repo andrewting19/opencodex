@@ -541,6 +541,8 @@ async function resolveAlternateCompactContext(args: {
   excludeAccountId: string | null;
   turnAdmissionLease?: AdmissionLease;
   admission?: DataPlaneAdmission;
+  /** Fork patch 5: last-resort pick inside a compaction quota walk. */
+  allowQuotaProbe?: boolean;
 }): Promise<{ authCtx: CodexAuthContext; provider: OcxProviderConfig; headers: Headers } | null> {
   const { req, config, route, selectedModelId, excludeAccountId, turnAdmissionLease } = args;
   if (!route.codexAccountMode || !excludeAccountId) return null;
@@ -549,6 +551,7 @@ async function resolveAlternateCompactContext(args: {
       admission: args.admission,
       ...(selectedModelId ? { modelId: selectedModelId } : {}),
       excludeAccountId,
+      ...(args.allowQuotaProbe ? { allowQuotaProbe: true } : {}),
       requestScopedMainCredential: hasForwardableCodexBearer(req.headers, config),
       beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
     });
@@ -1104,6 +1107,7 @@ export async function handleResponsesCompact(
     // final-recovery reserve, which is the same rule the Responses path follows.
     const sendSingleCompactAttempt = async (
       doFetch: () => Promise<Response>,
+      quotaWalk = false,
     ): Promise<Response> => {
       if (sendBudget.remainingBaseSends(TRANSIENT_RETRY_MAX_ATTEMPTS) > 0) {
         const report = createPhysicalSendReporter(sendBudget, () => ({ poolId: logCtx.spendPoolId ?? route.providerName,
@@ -1122,6 +1126,9 @@ export async function handleResponsesCompact(
         sendClass: "auth-recovery",
         targetKey: compactTargetKey,
       });
+      // Fork patch 5: a later move in a quota walk is bounded by the walk (each account once,
+      // two minutes), so it may pass the spent shared reserve.
+      if (!decision.allowed && quotaWalk) return doFetch();
       if (!decision.allowed) return Promise.reject(new SendBudgetExhaustedError(safeHostLabel(compactUrl)));
       const dispatch = () => {
         if (!decision.permit.use()) {
@@ -1138,6 +1145,7 @@ export async function handleResponsesCompact(
       recovery: "normal" | "single",
       sendAuthCtx: CodexAuthContext,
       onPhysicalDispatch?: () => void,
+      quotaWalk = false,
     ): Promise<Response> => {
       // A gateway send carries only its own transport headers, whatever recovery handed in.
       let wireHeaders = gatewayTransport ? new Headers(gatewayTransport.headers) : sendHeaders;
@@ -1243,7 +1251,7 @@ export async function handleResponsesCompact(
         return res;
       });
       return recovery === "single"
-        ? sendSingleCompactAttempt(doFetch)
+        ? sendSingleCompactAttempt(doFetch, quotaWalk)
         : fetchWithTransientRetry(doFetch, {
           abortSignal: req.signal,
           label: safeHostLabel(compactUrl),
@@ -1432,19 +1440,40 @@ export async function handleResponsesCompact(
     // (core.ts:319-423) and recognizes exactly 429/402. Without it a pool rejection
     // surfaces to the client, which retries the compact task OUTSIDE the logical request
     // — reporting exhausted retries while another pool account sat idle (#913).
-    if (
-      (upstream.status === 429 || upstream.status === 402 || wasAccountAutoPaused(upstream))
+    //
+    // Fork patch 5: this is a walk. A quota refusal (429/402, or a 5xx whose body confirms
+    // quota) moves to the next eligible account until one serves, each account at most once,
+    // for at most two minutes. Each refused account is recorded, and so cooled, before the next
+    // selection. `quotaFailCtx` is the account that produced the current refusal.
+    let quotaFailCtx = authCtx;
+    const quotaWalkTried = new Set<string>();
+    const quotaWalkDeadline = Date.now() + 120_000;
+    let quotaWalkContinuing = false;
+    const wrappedQuotaStatus = async (response: Response): Promise<number | undefined> => {
+      if (response.status === 429 || response.status === 402) return response.status;
+      if (response.status >= 500 && response.status < 600
+        && await shouldRetryCodexPoolAccountQuota(response, req.signal)) return 429;
+      return undefined;
+    };
+    for (;;) {
+    const quotaStatus = await wrappedQuotaStatus(upstream);
+    if (!(
+      (quotaStatus !== undefined || wasAccountAutoPaused(upstream))
       // A replay refusal this proxy synthesized carries 429 for the client's benefit only.
       // It is not pool quota evidence, and the alternate account below is another send of a
       // compact turn that may already have been processed.
       && !isNonReplayableResponse(upstream)
-      && (!storedPool401ReplayAttempted || wasAccountAutoPaused(upstream))
+      // Fork patch 5: a quota refusal after a stored refresh is about that account; it may walk.
+      && (!storedPool401ReplayAttempted || wasAccountAutoPaused(upstream) || quotaStatus !== undefined)
       && !gatewayTransport
       && usesCodexForwardPoolAuth(authCtx, route.provider)
       && !authCtx.fixedAccount
       && route.codexAccountMode
       && !req.signal.aborted
-    ) {
+      && (!quotaWalkContinuing || (Date.now() < quotaWalkDeadline && quotaStatus !== undefined))
+    )) break;
+    {
+      const refusalStatus = quotaStatus ?? upstream.status;
       const firstRetryAfter = upstream.headers.get("retry-after");
       const firstResetAt = [
         upstream.headers.get("x-codex-primary-reset-at"),
@@ -1458,17 +1487,22 @@ export async function handleResponsesCompact(
       // resolution costs nothing. It also reuses the guarantee the comment above depends on --
       // the first body is still uncancelled -- so the client gets the original rejection rather
       // than an inaccessible-file error from account B (#4710).
-      const alternate = conversationCarriesUploadedFiles(raw)
-        ? undefined
-        : await resolveAlternateCompactContext({
+      const resolveCompactAlternate = (allowQuotaProbe: boolean) => resolveAlternateCompactContext({
           req,
           admission,
           config,
           route,
           selectedModelId,
-          excludeAccountId: authCtx.accountId,
+          excludeAccountId: quotaFailCtx.accountId,
           turnAdmissionLease,
+          allowQuotaProbe,
         });
+      const alternate = conversationCarriesUploadedFiles(raw)
+        ? undefined
+        // Fork patch 5: when every account is cooled, a quota refusal may use the one bounded
+        // probe a due cooldown allows.
+        : await resolveCompactAlternate(false)
+          ?? (quotaStatus !== undefined ? await resolveCompactAlternate(true) : null);
       // Resolution can await a credential refresh, so the client may have gone away
       // while we were choosing B. Re-check before spending anything: recording A,
       // cancelling its body, and sending B are all observable side effects, and B's
@@ -1487,7 +1521,9 @@ export async function handleResponsesCompact(
       const sharedWorkspaceScope = alternate != null
         && !await shouldRetryCodexScopedQuotaOnAlternate(
           upstream,
-          authCtx.chatgptAccountId,
+          quotaFailCtx.kind === "pool" || quotaFailCtx.kind === "main-pool"
+            ? quotaFailCtx.chatgptAccountId
+            : callerCodexWorkspaceAccountId(req.headers) ?? "",
           alternate.authCtx.kind === "pool" || alternate.authCtx.kind === "main-pool"
             ? alternate.authCtx.chatgptAccountId
             : callerCodexWorkspaceAccountId(req.headers),
@@ -1510,18 +1546,18 @@ export async function handleResponsesCompact(
         // quota snapshot that produced it, so refresh A's cache before recording its
         // rejection. Skipping this leaves quota-strategy routing and the dashboard
         // reading numbers from before the account ran out.
-        if (authCtx.kind === "pool" || authCtx.kind === "main-pool") {
+        if (quotaFailCtx.kind === "pool" || quotaFailCtx.kind === "main-pool") {
           const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/auth-api");
           applyAccountQuotaFromUpstreamHeaders(
-            authCtx.accountId,
+            quotaFailCtx.accountId,
             upstream.headers,
-            authCtx.writerGeneration,
-            authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
-            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined,
-              poolResponse: authCtx.kind === "pool" },
+            quotaFailCtx.writerGeneration,
+            quotaFailCtx.kind === "main-pool" ? quotaFailCtx.mainQuotaWriter : undefined,
+            { modelId: route.modelId, poolWriter: quotaFailCtx.kind === "pool" ? quotaFailCtx.poolQuotaWriter : undefined,
+              poolResponse: quotaFailCtx.kind === "pool" },
           );
         }
-        recordCompactPoolOutcome(authCtx, upstream.status, {
+        recordCompactPoolOutcome(quotaFailCtx, refusalStatus, {
           retryAfter: firstRetryAfter,
           resetAt: firstResetAt,
           ...(alternate.authCtx.accountId ? { promoteAccountId: alternate.authCtx.accountId } : {}),
@@ -1531,11 +1567,20 @@ export async function handleResponsesCompact(
         logCtx.accountLogLabel = codexAuthContextLogLabel(alternate.authCtx, config);
         scrubCompactStateForAlternate(alternate.authCtx);
         try {
-          upstream = await sendCompactAttempt(alternate.provider, alternate.headers, "single", alternate.authCtx);
+          upstream = await sendCompactAttempt(alternate.provider, alternate.headers, "single", alternate.authCtx,
+            undefined, (quotaWalkContinuing || storedPool401ReplayAttempted) && quotaStatus !== undefined);
         } catch (err) {
           return failedAlternateCompactSend(err);
         }
+        if (quotaFailCtx.accountId) quotaWalkTried.add(quotaFailCtx.accountId);
+        quotaFailCtx = alternate.authCtx;
+        if (!(quotaFailCtx.accountId && quotaWalkTried.has(quotaFailCtx.accountId))) {
+          quotaWalkContinuing = true;
+          continue;
+        }
       }
+    }
+    break;
     }
     // A transient 5xx that survived the same-account ladder above (#6969). The regular path moves
     // it to another Pool account; compact used to move only on 429/402, so the client retried the
